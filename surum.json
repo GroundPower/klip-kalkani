@@ -1,12 +1,12 @@
 {
-  "surum": "1.7.1",
-  "etiket": "v1.7.1",
+  "surum": "1.8",
+  "etiket": "v1.8",
   "tarih": "2026-09-29",
-  "notlar": "Kısayol oluşturma düzeltmesi (1.7'deki exe başlatıcı, sade menü ve %APPDATA% ayarlarıyla birlikte).",
+  "notlar": "Düzenle: ses kanalları (tüm ses / oyun / Discord / mikrofon) için aç/kapat, seviye %0–200, tek dinle ve seviye göstergesi; kaydederken tek kanal karışım ya da ayrı kanallar.",
   "dosyalar": {
-    "klip_kalkani.py": "6ec9b000407f25c7e53aa1250597516d040a39e92bda47b1619b1a589154d9eb",
+    "klip_kalkani.py": "420d20d067cef690d439c96b83ca7ae29935e91171a78de0c606a120c88a9189",
     "arayuz.pyw": "cfb55c47bb97a962c5913f835ec8b09d60b77a426ab70ace24ecf32df4a9bb7b",
-    "duzenle.py": "85fff8e09eeea7b0d086c982ed8780e93cf56f3949324812e68b7b018e2a3987",
+    "duzenle.py": "de87a3ab4407eb4eef38e4e1a3f5877bee06b4278d76ee5919b9ccf51fc5eae1",
     "kalkan.ico": "e6190e96224a6adf554c9811b09a956be68943c4d48433d8e4435aeaee971504",
     "Klip Kalkanı.exe": "6e3b66fa809f7c58a09e41ce067c424995258ed1a7c4a7fe33f2b1925fc6d202"
   },

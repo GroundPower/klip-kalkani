@@ -5,14 +5,19 @@
 - Kes: A (başlangıç) ve B (bitiş) işaretle, kaydet.
     * Kayıpsız: yeniden kodlamadan kopyalar (çok hızlı, kalite aynen). En yakın önceki anahtar kareden başlar.
     * Tam kare: sadece görüntüyü NVIDIA ekran kartıyla yeniden kodlar, tam A karesinden başlar.
+- Ses kanalları: her kanal (Medal'de tüm ses, oyun, Discord, mikrofon) için aç/kapat, seviye (%0–200),
+  tek dinle ve seviye göstergesi. Oynarken değiştirmek anında duyulur. Kaydederken ses olduğu gibi kopyalanır
+  ya da ayarlanan seviyelerle tek kanalda birleştirilir / ayrı kanallar olarak yeniden kodlanır (AAC).
 - Birleştir: aynı ayarlarla kaydedilmiş klipleri kayıpsız uç uca ekler.
 Orijinal dosyalara hiç dokunulmaz; sonuç her zaman yeni bir dosyaya yazılır.
 """
 
+import math
 import os
 import threading
 import time
 import tkinter as tk
+import warnings
 from fractions import Fraction
 from tkinter import filedialog, messagebox, ttk
 
@@ -23,11 +28,22 @@ try:
     import sounddevice as sd
 except Exception:  # ses kütüphanesi yoksa önizleme sessiz çalışır
     sd = None
+with warnings.catch_warnings():
+    warnings.simplefilter('ignore', DeprecationWarning)
+    import audioop  # ses karıştırma (C'de, hızlı); Python 3.12 ile gelir
 
 VIDEO_TYPES = [('Video', '*.mp4 *.mkv *.mov *.webm *.avi'), ('Tüm dosyalar', '*.*')]
 PREVIEW_W, PREVIEW_H = 800, 450
 DISPLAY_FPS = 60  # varsayılan önizleme FPS'i (0 = klibin kendi FPS'i)
 GREEN, RED, BLUE, GREY = '#22c55e', '#ef4444', '#3b82f6', '#9ca3af'
+YELLOW = '#eab308'
+MIX_RATE = 48000       # dışa aktarılan karışımın örnekleme hızı
+MIX_BITRATE = 192000   # AAC
+MAX_GAIN = 200         # seviye sürgüsünün sonu (%)
+AUDIO_MODES = ['Olduğu gibi', 'Tek kanal (karışım)', 'Ayrı kanallar (ayarlı)']
+# Medal kanal adları → Türkçe
+TRACK_NAMES = {'all audio': 'Tüm ses', 'microphone': 'Mikrofon', 'mic': 'Mikrofon', 'discord': 'Discord',
+               'desktop audio': 'Masaüstü sesi', 'system audio': 'Sistem sesi', 'game': 'Oyun'}
 
 
 class Cancelled(Exception):
@@ -58,9 +74,174 @@ def probe(path):
             rate = v.average_rate or v.guessed_rate
             info.update(width=v.codec_context.width, height=v.codec_context.height,
                         fps=float(rate) if rate else 30.0, codec=v.codec_context.name)
-        for i, a in enumerate(c.streams.audio):
-            info['audio'].append(f'Ses kanalı {i + 1}')
+        names = [(a.metadata.get('name') or a.metadata.get('title') or '').strip() for a in c.streams.audio]
+        medal = any(n.lower() == 'all audio' for n in names)
+        for i, n in enumerate(names):
+            if n.lower() in TRACK_NAMES:
+                label = TRACK_NAMES[n.lower()]
+            elif n:
+                label = f'Oyun ({n})' if medal else n  # Medal'de adı süreç olan kanal oyunun sesi
+            else:
+                label = f'Ses kanalı {i + 1}'
+            info['audio'].append(label)
+        info['audio_names'] = names
         return info
+
+
+# ---------------------------------------------------------------- ses karıştırma
+
+class TrackMix:
+    """Ses kanallarının ayarı: her kanal için açık/kapalı, seviye (1.0 = %100) ve "tek dinle".
+    Önizleme her 40 ms'de okur, yani oynarken değiştirmek anında duyulur."""
+
+    def __init__(self, n):
+        self.n = n
+        self.on = [i == 0 for i in range(n)]   # varsayılan: ilk kanal (Medal'de "tüm ses") = orijinal
+        self.gain = [1.0] * n
+        self.solo = None
+        self.levels = [0.0] * n                # önizlemede ölçülen son tepe (1.0 = taşma sınırı)
+
+    def audible(self):
+        """Şu an duyulan kanallar: [(sıra, seviye)]"""
+        if self.solo is not None:
+            return [(self.solo, self.gain[self.solo] or 1.0)]
+        return [(i, self.gain[i]) for i in range(self.n) if self.on[i] and self.gain[i] > 0]
+
+    def is_default(self):
+        return self.on == [i == 0 for i in range(self.n)] and all(abs(g - 1.0) < 1e-6 for g in self.gain)
+
+    def plan(self, mode):
+        """Dışa aktarma planı: çıkıştaki her ses kanalı için [(giriş sırası, seviye)]. None = olduğu gibi kopyala."""
+        active = [(i, self.gain[i]) for i in range(self.n) if self.on[i] and self.gain[i] > 0]
+        if mode == 'karisim':
+            return [active] if active else []
+        if mode == 'ayri':
+            return [[x] for x in active]
+        return None
+
+
+class _Track:
+    """Bir ses kanalını start anından itibaren s16 stereo baytlara çevirir. Kanallar aynı andan başlasın diye
+    baştaki fazlayı atar ya da eksik kalan başa sessizlik koyar."""
+
+    def __init__(self, rate, start, end=None):
+        self.res = av.AudioResampler(format='s16', layout='stereo', rate=rate)
+        self.rate, self.start, self.end = rate, start, end
+        self.buf = bytearray()
+        self.first = True
+        self.ended = False
+
+    def feed(self, frame):
+        if self.ended:
+            return
+        t = frame.time
+        if self.end is not None and t is not None and t > self.end:
+            self.ended = True
+            return
+        if self.first and t is not None and t + frame.samples / (frame.sample_rate or self.rate) <= self.start:
+            return  # tamamen başlangıçtan önce
+        data = b''.join(bytes(rf.planes[0])[:rf.samples * 4] for rf in self.res.resample(frame))
+        if self.first:
+            off = round(((t if t is not None else self.start) - self.start) * self.rate) * 4
+            data = data[-off:] if off < 0 else bytes(off) + data
+            self.first = False
+        self.buf += data
+
+    def take(self, n):
+        chunk = bytes(self.buf[:n])
+        del self.buf[:n]
+        return chunk + bytes(n - len(chunk))
+
+
+def _ready(tracks):
+    """Hepsinden aynı anda alınabilecek bayt (bitmiş kanallar sessizlikle tamamlanır)."""
+    live = [len(t.buf) for t in tracks if not t.ended]
+    n = min(live) if live else max((len(t.buf) for t in tracks), default=0)
+    return n - n % 4
+
+
+def mix_bytes(parts):
+    """[(s16 stereo bayt, seviye)] → tek karışım; taşan yerler kırpılır (bozulma değil, sınırda kalır)."""
+    acc = None
+    for data, gain in parts:
+        if gain != 1.0:
+            data = audioop.mul(data, 2, gain)
+        acc = data if acc is None else audioop.add(acc, data, 2)
+    return acc
+
+
+class MixEncoder:
+    """Dışa aktarmada: plandaki her çıkış kanalı için karışımı AAC olarak kodlayıp dosyaya yazar."""
+
+    def __init__(self, out, inp, plan, end):
+        self.out, self.plan, self.end = out, plan, end
+        audio = list(inp.streams.audio)
+        self.used = sorted({k for track in plan for k, _ in track})
+        self.index = {audio[k].index: k for k in self.used}
+        self.streams = []
+        for _ in plan:
+            s = out.add_stream('aac', rate=MIX_RATE, layout='stereo')
+            s.bit_rate = MIX_BITRATE
+            self.streams.append((s, av.AudioResampler(format='fltp', layout='stereo', rate=MIX_RATE,
+                                                      frame_size=1024)))
+        self.tracks = None
+        self.pending = []
+        self.pts = 0
+        self.limit = None
+
+    def start(self, t0):
+        """Çıkışta 0 kabul edilen an belli oldu (görüntüyle aynı): o ana kadar biriken paketler de işlenir."""
+        self.tracks = {k: _Track(MIX_RATE, t0, self.end) for k in self.used}
+        self.limit = max(0, round((self.end - t0) * MIX_RATE)) * 4
+        pending, self.pending = self.pending, []
+        for pkt in pending:
+            self.feed(pkt)
+
+    def done(self):
+        return self.tracks is not None and all(t.ended for t in self.tracks.values())
+
+    def feed(self, pkt):
+        if self.tracks is None:
+            self.pending.append(pkt)
+            return
+        track = self.tracks[self.index[pkt.stream.index]]
+        for frame in pkt.decode():
+            track.feed(frame)
+        self._write(final=False)
+
+    def _write(self, final):
+        tracks = list(self.tracks.values())
+        step = MIX_RATE // 10 * 4
+        while True:
+            n = min(_ready(tracks), self.limit - self.pts * 4)
+            if n <= 0 or (n < step and not final):
+                return
+            n = min(n, step)
+            chunks = {k: t.take(n) for k, t in self.tracks.items()}
+            for (s, res), track in zip(self.streams, self.plan):
+                frame = av.AudioFrame(format='s16', layout='stereo', samples=n // 4)
+                data = mix_bytes([(chunks[k], g) for k, g in track])
+                frame.planes[0].update(data + bytes(frame.planes[0].buffer_size - len(data)))
+                frame.sample_rate = MIX_RATE
+                frame.pts = self.pts
+                frame.time_base = Fraction(1, MIX_RATE)
+                for f in res.resample(frame):
+                    for pk in s.encode(f):
+                        self.out.mux(pk)
+            self.pts += n // 4
+
+    def finish(self):
+        if self.tracks is None:
+            self.start(0.0)
+        for t in self.tracks.values():
+            t.ended = True
+        self._write(final=True)
+        for s, res in self.streams:
+            for f in res.resample(None):
+                for pk in s.encode(f):
+                    self.out.mux(pk)
+            for pk in s.encode(None):
+                self.out.mux(pk)
 
 
 # ---------------------------------------------------------------- dışa aktarma (arka planda çalışır)
@@ -84,15 +265,24 @@ def keyframe_before(src, t):
     return 0.0
 
 
-def cut_copy(src, dst, a, b, progress=None, cancel=None):
-    """Kayıpsız kesim: paketleri yeniden kodlamadan kopyalar. Döndürür: gerçek başlangıç zamanı."""
+def _audio_inputs(inp, plan):
+    """Plan varsa sadece karışıma giren ses kanalları, yoksa hepsi (olduğu gibi kopya)."""
+    audio = list(inp.streams.audio)
+    return audio if plan is None else [audio[k] for k in sorted({k for tr in plan for k, _ in tr})]
+
+
+def cut_copy(src, dst, a, b, progress=None, cancel=None, audio_plan=None):
+    """Kayıpsız kesim: görüntüyü yeniden kodlamadan kopyalar. audio_plan verilirse ses bu plana göre
+    karıştırılıp AAC olarak kodlanır, yoksa kanallar olduğu gibi kopyalanır. Döndürür: gerçek başlangıç zamanı."""
     start = keyframe_before(src, a)
     with av.open(src) as inp:
-        streams = _media_streams(inp)
         v = inp.streams.video[0]
+        streams = [v] + _audio_inputs(inp, audio_plan)
         inp.seek(int(start / v.time_base), stream=v, backward=True, any_frame=False)
         with av.open(dst, 'w', options=_out_options(dst)) as out:
-            omap = {s.index: out.add_stream_from_template(s) for s in streams}
+            copied = streams if audio_plan is None else [v]
+            omap = {s.index: out.add_stream_from_template(s) for s in copied}
+            mixer = MixEncoder(out, inp, audio_plan, b) if audio_plan else None
             zero = None           # çıkışta 0 kabul edilen an (saniye)
             done = set()
             for pkt in inp.demux(streams):
@@ -101,12 +291,21 @@ def cut_copy(src, dst, a, b, progress=None, cancel=None):
                 s = pkt.stream
                 if pkt.pts is None or pkt.dts is None or s.index in done:
                     continue
+                if mixer is not None and s.type == 'audio':
+                    mixer.feed(pkt)
+                    if mixer.done():
+                        done.update(x.index for x in streams if x.type == 'audio')
+                    if len(done) == len(streams):
+                        break
+                    continue
                 pts, dts = float(pkt.pts * s.time_base), float(pkt.dts * s.time_base)
                 if zero is None:
                     # ilk yazılan paket, başlangıçtaki anahtar kare olmalı
                     if s.type != 'video' or not pkt.is_keyframe or pts < start - 1e-6:
                         continue
                     zero = min(pts, dts)
+                    if mixer is not None:
+                        mixer.start(zero)
                 if s.type == 'video':
                     if dts > b:
                         done.add(s.index)
@@ -125,6 +324,8 @@ def cut_copy(src, dst, a, b, progress=None, cancel=None):
                     progress(min(1.0, (pts - start) / max(0.001, b - start)))
                 if len(done) == len(streams):
                     break
+            if mixer is not None:
+                mixer.finish()
     return start
 
 
@@ -137,12 +338,13 @@ def _pick_encoder(codec_name):
     return 'libx264', {'crf': '18', 'preset': 'veryfast'}
 
 
-def cut_reencode(src, dst, a, b, progress=None, cancel=None):
-    """Tam kare kesim: görüntü yeniden kodlanır (NVIDIA varsa onunla), ses kopyalanır."""
+def cut_reencode(src, dst, a, b, progress=None, cancel=None, audio_plan=None):
+    """Tam kare kesim: görüntü yeniden kodlanır (NVIDIA varsa onunla); ses kopyalanır ya da audio_plan'a göre
+    karıştırılıp AAC olarak kodlanır."""
     with av.open(src) as inp:
         v = inp.streams.video[0]
         v.thread_type = 'AUTO'
-        auds = list(inp.streams.audio)
+        auds = _audio_inputs(inp, audio_plan)
         enc_name, opts = _pick_encoder(v.codec_context.name)
         with av.open(dst, 'w', options=_out_options(dst)) as out:
             rate = v.average_rate or v.guessed_rate or Fraction(60)
@@ -151,7 +353,10 @@ def cut_reencode(src, dst, a, b, progress=None, cancel=None):
             ov.pix_fmt = 'yuv420p'
             ov.time_base = v.time_base
             ov.codec_context.time_base = v.time_base
-            oa = {s.index: out.add_stream_from_template(s) for s in auds}
+            oa = {s.index: out.add_stream_from_template(s) for s in auds} if audio_plan is None else {}
+            mixer = MixEncoder(out, inp, audio_plan, b) if audio_plan else None
+            if mixer is not None:
+                mixer.start(a)
             inp.seek(int(a / v.time_base), stream=v, backward=True, any_frame=False)
             v_off = round(a / v.time_base)
             v_done = False
@@ -176,6 +381,11 @@ def cut_reencode(src, dst, a, b, progress=None, cancel=None):
                             out.mux(op)
                         if progress:
                             progress(min(1.0, (frame.time - a) / max(0.001, b - a)))
+                elif mixer is not None:
+                    if pkt.pts is not None and s.index not in a_done:
+                        mixer.feed(pkt)
+                        if mixer.done():
+                            a_done.update(x.index for x in auds)
                 else:
                     if pkt.pts is None or s.index in a_done:
                         continue
@@ -194,6 +404,8 @@ def cut_reencode(src, dst, a, b, progress=None, cancel=None):
                     break
             for op in ov.encode(None):
                 out.mux(op)
+            if mixer is not None:
+                mixer.finish()
     return a
 
 
@@ -261,34 +473,56 @@ def concat_copy(files, dst, progress=None, cancel=None):
 # ---------------------------------------------------------------- önizleme oynatıcı
 
 class AudioOut(threading.Thread):
-    """Seçili ses kanalını start'tan itibaren varsayılan ses çıkışına çalar."""
+    """Ses kanallarını TrackMix'teki ayarlarla karıştırıp start'tan itibaren varsayılan ses çıkışına çalar.
+    Ayarlar çalarken değişebilir; her kanalın seviyesi göstergeler için mix.levels'a yazılır."""
 
-    def __init__(self, path, index, start, end, stop):
+    CHUNK = 0.04  # sn: ayar değişikliği en geç bu kadar sonra duyulur
+
+    def __init__(self, path, mix, start, end, stop):
         super().__init__(daemon=True)
-        self.path, self.index, self.start_t, self.end_t, self.stop = path, index, start, end, stop
+        self.path, self.mix, self.start_t, self.end_t, self.stop = path, mix, start, end, stop
 
     def run(self):
         try:
             rate = int(sd.query_devices(kind='output')['default_samplerate'])
             with av.open(self.path) as c:
-                if self.index >= len(c.streams.audio):
+                streams = list(c.streams.audio)
+                if not streams:
                     return
-                a = c.streams.audio[self.index]
-                c.seek(int(self.start_t / a.time_base), stream=a)
-                res = av.AudioResampler(format='s16', layout='stereo', rate=rate)
+                c.seek(int(self.start_t / streams[0].time_base), stream=streams[0])
+                tracks = [_Track(rate, self.start_t, self.end_t) for _ in streams]
+                order = {s.index: k for k, s in enumerate(streams)}
+                chunk = int(rate * self.CHUNK) * 4
                 with sd.RawOutputStream(samplerate=rate, channels=2, dtype='int16') as out:
-                    for frame in c.decode(a):
+                    for pkt in c.demux(streams):
                         if self.stop.is_set():
                             return
-                        t = frame.time or 0.0
-                        if t + frame.samples / frame.sample_rate < self.start_t:
-                            continue
-                        if self.end_t is not None and t > self.end_t:
-                            return
-                        for rf in res.resample(frame):
-                            out.write(bytes(rf.planes[0])[:rf.samples * 4])
+                        track = tracks[order[pkt.stream.index]]
+                        if not track.ended:
+                            for frame in pkt.decode():
+                                track.feed(frame)
+                        while _ready(tracks) >= chunk:
+                            if self.stop.is_set():
+                                return
+                            out.write(self._mix(tracks, chunk))
+                        if all(t.ended for t in tracks):
+                            break
+                    for t in tracks:
+                        t.ended = True
+                    n = _ready(tracks)
+                    if n and not self.stop.is_set():
+                        out.write(self._mix(tracks, n))
         except Exception as e:  # ses yoksa önizleme sessiz devam eder
             print('ses hatası:', e)
+        finally:
+            self.mix.levels = [0.0] * self.mix.n
+
+    def _mix(self, tracks, n):
+        mix = self.mix
+        chunks = [t.take(n) for t in tracks]
+        mix.levels = [audioop.max(ch, 2) / 32768 * mix.gain[k] for k, ch in enumerate(chunks)]
+        parts = [(chunks[k], g) for k, g in mix.audible() if k < len(chunks)]
+        return mix_bytes(parts) if parts else bytes(n)
 
 
 class Player:
@@ -303,7 +537,7 @@ class Player:
         self.latest = None          # (PIL görüntü, zaman)
         self.pos = 0.0
         self.playing = False
-        self.audio_index = 0
+        self.mix = None             # TrackMix (düzenleyici verir)
         self.muted = False
         self.display_fps = DISPLAY_FPS
         self.emitted = 0            # ekrana gönderilen kare sayısı (FPS göstergesi için)
@@ -369,8 +603,8 @@ class Player:
     def _play(self, c, v, start, end):
         self.playing = True
         stop = threading.Event()
-        if sd is not None and not self.muted and self.info['audio']:
-            AudioOut(self.path, self.audio_index, start, end, stop).start()
+        if sd is not None and not self.muted and self.mix is not None:
+            AudioOut(self.path, self.mix, start, end, stop).start()
         try:
             c.seek(int(start / v.time_base), stream=v, backward=True, any_frame=False)
             t0 = time.perf_counter() + 0.12   # ses çıkışının gecikmesine kabaca eşitle
@@ -475,6 +709,10 @@ class EditorTab:
         self._shown = []          # son 1 sn'de ekrana basılan karelerin zamanları (FPS göstergesi)
         self._fps_shown_at = 0.0
         self.job_cancel = None
+        self.mix = None
+        self.mix_rows = []
+        self._meter_at = 0.0
+        self._auto_mode = False
         self.bg = ttk.Style(parent).lookup('TFrame', 'background') or '#1c1c1c'
 
         nb = ttk.Notebook(parent)
@@ -509,7 +747,7 @@ class EditorTab:
 
         # Önizleme alanı: ekran ölçeklemesine ve yüksekliğine göre (küçük ekranda alttaki tuşlar kaybolmasın)
         scale = max(1.0, t.winfo_fpixels('1i') / 96.0)
-        ph = int(min(PREVIEW_H * scale, max(240, t.winfo_screenheight() - 90 - 500 * scale)))
+        ph = int(min(PREVIEW_H * scale, max(240, t.winfo_screenheight() - 90 - 590 * scale)))
         self.box = (ph * 16 // 9, ph)
         box = tk.Frame(t, bg='black', width=self.box[0], height=self.box[1])
         box.pack(pady=(10, 6))
@@ -534,13 +772,14 @@ class EditorTab:
         self.fps_lbl.pack(side='left')
         self.mute = tk.BooleanVar(value=False)
         ttk.Checkbutton(ctl, text='Sessiz', variable=self.mute, command=self._mute_changed).pack(side='right')
-        self.audio_cb = ttk.Combobox(ctl, values=[], width=13, state='readonly')
-        self.audio_cb.pack(side='right', padx=6)
-        self.audio_cb.bind('<<ComboboxSelected>>', lambda _e: self._audio_changed())
         self.fps_cb = ttk.Combobox(ctl, values=['30 FPS', '60 FPS', 'Tam FPS'], width=8, state='readonly')
         self.fps_cb.current(1)
         self.fps_cb.pack(side='right', padx=(6, 0))
         self.fps_cb.bind('<<ComboboxSelected>>', lambda _e: self._fps_changed())
+
+        # ses kanalları (klip açılınca dolar)
+        self.mix_box = ttk.Frame(t)
+        self.mix_box.pack(fill='x', pady=(8, 0))
 
         sel = ttk.Frame(t)
         sel.pack(fill='x', pady=(8, 0))
@@ -558,6 +797,11 @@ class EditorTab:
         self.mode.current(0)
         self.mode.pack(side='left', padx=6)
         self.mode.bind('<<ComboboxSelected>>', lambda _e: self._mode_hint())
+        ttk.Label(r, text='  Ses:').pack(side='left')
+        self.audio_mode = ttk.Combobox(r, values=AUDIO_MODES, width=20, state='readonly')
+        self.audio_mode.current(0)
+        self.audio_mode.pack(side='left', padx=6)
+        self.audio_mode.bind('<<ComboboxSelected>>', lambda _e: self._mode_hint())
         self.cut_btn = ttk.Button(r, text='Kes ve kaydet…', style='Accent.TButton', command=self.export_cut)
         self.cut_btn.pack(side='left', padx=(6, 0))
         self.cut_stop = ttk.Button(r, text='İptal', command=self.cancel_job, state='disabled')
@@ -581,10 +825,19 @@ class EditorTab:
     def _mode_hint(self):
         if self.mode.current() == 1:
             text = ('Tam kare: tam A karesinden başlar. Görüntü NVIDIA ekran kartıyla yüksek kalitede yeniden '
-                    'kodlanır, ses aynen kopyalanır. Klip uzunluğu kadar sürebilir.')
+                    'kodlanır. Klip uzunluğu kadar sürebilir.')
         else:
-            text = ('Kayıpsız: yeniden kodlamadan kopyalar, saniyeler sürer ve kalite birebir aynı kalır. '
+            text = ('Kayıpsız: görüntüyü yeniden kodlamadan kopyalar, saniyeler sürer ve kalite birebir aynı kalır. '
                     'Başlangıç en yakın önceki anahtar kareye (genelde <0,5 sn önce) denk gelir.')
+        m = self.audio_mode.current()
+        if m == 1:
+            text += ('  Ses: açık kanallar ayarladığın seviyelerle tek kanalda birleşir (AAC); Discord\'da ve '
+                     'telefonda hepsi duyulur.')
+        elif m == 2:
+            text += '  Ses: açık kanallar ayrı ayrı, ayarladığın seviyelerle kaydedilir (AAC).'
+        else:
+            text += ('  Ses: bütün kanallar olduğu gibi kopyalanır (Discord\'da ve telefonda sadece ilk kanal '
+                     'çalar).')
         self.mode_hint.configure(text=text)
 
     def open_file(self, path=None):
@@ -605,14 +858,13 @@ class EditorTab:
         self.info = info
         self.player = Player(path, info, self.box)
         self.player.muted = self.mute.get()
+        self.player.mix = self.mix
         i = self.fps_cb.current()
         self.fps_cb.configure(values=['30 FPS', '60 FPS', f'Tam ({info["fps"]:.0f})'])
         self.fps_cb.current(i)
         self._fps_changed()
         self.a = self.b = None
-        self.audio_cb.configure(values=info['audio'])
-        if info['audio']:
-            self.audio_cb.current(0)
+        self._build_mixer()
         self.file_lbl.configure(text=f'{os.path.basename(path)}  ·  {info["width"]}×{info["height"]}  ·  '
                                      f'{info["fps"]:.0f} FPS  ·  {info["codec"].upper()}  ·  '
                                      f'{fmt_time(info["duration"])}  ·  {fmt_size(info["size"])}  ·  '
@@ -671,9 +923,111 @@ class EditorTab:
         if self.player.playing:  # yeni ayarla kaldığı yerden sürsün
             self.player.request('play', self.player.pos, None)
 
-    def _audio_changed(self):
-        if self.player:
-            self.player.audio_index = max(0, self.audio_cb.current())
+    # ------------------------------------------------ ses kanalları
+    def _build_mixer(self):
+        for w in self.mix_box.winfo_children():
+            w.destroy()
+        n = len(self.info['audio'])
+        self.mix = TrackMix(n) if n else None
+        self.mix_rows = []
+        self._auto_mode = False
+        self.audio_mode.current(0)
+        self.audio_mode.configure(state='readonly' if n else 'disabled')
+        self._mode_hint()
+        if self.player is not None:
+            self.player.mix = self.mix
+        if not n:
+            ttk.Label(self.mix_box, text='Bu klipte ses yok.', style='Muted.TLabel').pack(anchor='w')
+            return
+        head = ttk.Frame(self.mix_box)
+        head.pack(fill='x')
+        ttk.Label(head, text='Ses kanalları', font=('Segoe UI Semibold', 10)).pack(side='left')
+        ttk.Label(head, text='oynatırken değiştir, anında duyarsın · sürgüye çift tıkla: %100',
+                  style='Muted.TLabel').pack(side='left', padx=10)
+        if n > 1:
+            ttk.Button(head, text='Sıfırla', command=self.mix_reset).pack(side='right')
+            if (self.info.get('audio_names') or [''])[0].lower() == 'all audio':
+                ttk.Button(head, text='Kanalları ayrı ayarla', command=self.mix_split).pack(side='right', padx=6)
+        grid = ttk.Frame(self.mix_box)
+        grid.pack(fill='x', pady=(4, 0))
+        for k, label in enumerate(self.info['audio']):
+            cell = ttk.Frame(grid, padding=(0, 0, 16, 0))
+            cell.grid(row=k // 4, column=k % 4, sticky='we')
+            grid.columnconfigure(k % 4, weight=1, uniform='kanal')
+            top = ttk.Frame(cell)
+            top.pack(fill='x')
+            on = tk.BooleanVar(value=self.mix.on[k])
+            ttk.Checkbutton(top, text=label, variable=on, command=lambda k=k: self._mix_changed(k)).pack(side='left')
+            solo = ttk.Button(top, text='Tek dinle', width=9, command=lambda k=k: self.mix_solo(k))
+            solo.pack(side='right')
+            pct = ttk.Label(top, text='%100', width=5, anchor='e')
+            pct.pack(side='right', padx=4)
+            val = tk.DoubleVar(value=100.0)
+            scale = ttk.Scale(cell, from_=0, to=MAX_GAIN, variable=val, command=lambda _v, k=k: self._mix_changed(k))
+            scale.pack(fill='x')
+            scale.bind('<Double-Button-1>', lambda _e, k=k: self._mix_set(k, on=None, pct=100))
+            meter = tk.Canvas(cell, height=6, highlightthickness=0, bg='#2b2b2b')
+            meter.pack(fill='x', pady=(2, 0))
+            self.mix_rows.append({'on': on, 'val': val, 'pct': pct, 'solo': solo, 'meter': meter, 'shown': 0.0})
+
+    def _mix_changed(self, k):
+        row = self.mix_rows[k]
+        value = round(row['val'].get())
+        self.mix.on[k] = bool(row['on'].get())
+        self.mix.gain[k] = value / 100
+        row['pct'].configure(text=f'%{value}')
+        # ayar değişince kayıtta da uygulansın: kendiliğinden "tek kanal" seçilir (elle değiştirilebilir);
+        # ayarlar varsayılana dönerse yine "olduğu gibi"
+        if not self._auto_mode and not self.mix.is_default() and self.audio_mode.current() == 0:
+            self._auto_mode = True
+            self.audio_mode.current(1)
+            self._mode_hint()
+        elif self._auto_mode and self.mix.is_default() and self.audio_mode.current() == 1:
+            self._auto_mode = False
+            self.audio_mode.current(0)
+            self._mode_hint()
+
+    def _mix_set(self, k, on=None, pct=None):
+        row = self.mix_rows[k]
+        if on is not None:
+            row['on'].set(on)
+        if pct is not None:
+            row['val'].set(pct)
+        self._mix_changed(k)
+
+    def mix_split(self):
+        """Medal: "tüm ses"i kapat, oyun / Discord / mikrofonu ayrı ayrı aç."""
+        for k in range(len(self.mix_rows)):
+            self._mix_set(k, on=k > 0, pct=100)
+
+    def mix_reset(self):
+        for k in range(len(self.mix_rows)):
+            self._mix_set(k, on=k == 0, pct=100)
+        if self.mix.solo is not None:
+            self.mix_solo(self.mix.solo)
+
+    def mix_solo(self, k):
+        """Sadece bu kanalı dinle (tekrar basınca normale döner)."""
+        self.mix.solo = None if self.mix.solo == k else k
+        for i, row in enumerate(self.mix_rows):
+            row['solo'].configure(text='● Dinleniyor' if self.mix.solo == i else 'Tek dinle',
+                                  style='Accent.TButton' if self.mix.solo == i else 'TButton')
+
+    def _draw_meters(self, playing):
+        mix = self.mix
+        audible = {k for k, _ in mix.audible()}
+        for k, row in enumerate(self.mix_rows):
+            level = mix.levels[k] if playing and k < len(mix.levels) else 0.0
+            shown = max(level, row['shown'] * 0.8)   # yavaş düşsün
+            row['shown'] = shown
+            c = row['meter']
+            w = max(1, c.winfo_width())
+            db = 20 * math.log10(shown) if shown > 1e-4 else -80.0
+            frac = max(0.0, min(1.0, (db + 60) / 60))
+            color = GREY if k not in audible else (RED if db > -1 else YELLOW if db > -9 else GREEN)
+            c.delete('all')
+            if frac > 0:
+                c.create_rectangle(0, 0, int(w * frac), 6, fill=color, outline='')
 
     def _frame_loop(self):
         p = self.player
@@ -699,6 +1053,9 @@ class EditorTab:
                 self._fps_shown_at = now
             if not p.playing and self.play_btn.cget('text') != '▶ Oynat' and not p._pending():
                 self.play_btn.configure(text='▶ Oynat')
+            if self.mix is not None and now - self._meter_at > 0.05:
+                self._meter_at = now
+                self._draw_meters(p.playing)
         self._loop_job = self.parent.after(4, self._frame_loop)
 
     # seçim
@@ -793,7 +1150,12 @@ class EditorTab:
             messagebox.showerror('Klip Kalkanı', 'Orijinal dosyanın üstüne yazılamaz, başka bir ad seç.')
             return
         exact = self.mode.current() == 1
-        fn = (lambda p, c: cut_reencode(src, dst, a, b, p, c)) if exact else (lambda p, c: cut_copy(src, dst, a, b, p, c))
+        plan = self.mix.plan((None, 'karisim', 'ayri')[self.audio_mode.current()]) if self.mix else None
+        if plan == [] and not messagebox.askyesno('Klip Kalkanı', 'Hiç ses kanalı açık değil. Klip sessiz '
+                                                                  'kaydedilsin mi?'):
+            return
+        cut = cut_reencode if exact else cut_copy
+        fn = lambda p, c: cut(src, dst, a, b, p, c, audio_plan=plan)  # noqa: E731
         self.cut_msg.configure(text='Kesiliyor…')
 
         def done(ok, val):
