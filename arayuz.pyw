@@ -3,8 +3,9 @@
 
 İlk açılışta kurulum (klip klasörleri, hız, Telegram girişi), sonra durum ekranı: ne yükleniyor,
 duraklat/devam, hız ayarı, oyunlar, klasörler, geri yükleme, klip düzenleme ve ayarlar (Telegram hesabı,
-çıkış, güncelleme). Pencereyi kapatmak yedeklemeyi durdurmaz; yedekleme arka planda (Görev Zamanlayıcı'daki
-"Klip Kalkani" görevi) çalışır.
+çıkış, güncelleme). Bütün işler üstteki menüde de var (otomatik başlatma, kısayollar, tarama, doğrulama,
+kaldırma…). Pencereyi kapatmak yedeklemeyi durdurmaz; yedekleme arka planda (Görev Zamanlayıcı'daki "Klip Kalkani"
+görevi) çalışır. Pencere genelde yanındaki "Klip Kalkanı.exe" ile açılır.
 """
 
 import asyncio
@@ -34,7 +35,9 @@ except ImportError:  # tema yoksa düz ttk ile de çalışır
     sv_ttk = None
 
 ICON_PATH = os.path.join(BASE, 'kalkan.ico')
+LAUNCHER = os.path.join(BASE, 'Klip Kalkanı.exe')
 FOLDERID_DESKTOP = '{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}'
+FOLDERID_PROGRAMS = '{A77F5D77-2E2B-44C3-A6A2-ABA601054A51}'  # Başlat menüsü > Programlar
 UNLIMITED = 100000
 SPEED_CHOICES = ['Yükleme yok', '2', '5', '8', '10', '15', '20', '25', '30', '40', '50', '75', '100', 'Sınırsız']
 NO_WINDOW = 0x08000000
@@ -119,6 +122,22 @@ def account_text(h):
     return s
 
 
+def update_result_text(info):
+    """Son güncelleme kontrolünün sonucu: (yazı, renk)."""
+    when, ok, val = info
+    at = dt.datetime.fromtimestamp(when).strftime('%H:%M')
+    if not ok:
+        return f'Kontrol edilemedi ({at}): {update_error_text(val)}', ORANGE
+    if val['durum'] == 'guncel':
+        return f'✔ Güncelsin, en son sürüm bu. (Son kontrol {at})', GREEN
+    if val['durum'] == 'kuruldu':
+        return f'✔ {val["surum"]} sürümü indirildi ve kuruldu. Üstteki "Yeni sürümü aç"a basınca geçer.', GREEN
+    if val['durum'] == 'gelistirici':
+        return (f'Bu bir geliştirici kopyası (git), kendini güncellemez. GitHub\'daki son sürüm: {val["uzak"]}. '
+                f'(Son kontrol {at})'), GREY
+    return 'Otomatik güncelleme bu kopyada kapalı.', GREY
+
+
 def update_error_text(e):
     if isinstance(e, urllib.error.HTTPError):
         return f'GitHub {e.code} hatası verdi'
@@ -143,22 +162,47 @@ def ensure_icon():
         return None
 
 
-def make_desktop_shortcut():
+def shortcut_paths():
+    """(masaüstü, Başlat menüsü) kısayolu."""
     desktop = kk.known_folder(FOLDERID_DESKTOP) or os.path.join(os.path.expanduser('~'), 'Desktop')
-    lnk = os.path.join(desktop, 'Klip Kalkanı.lnk')
+    programs = kk.known_folder(FOLDERID_PROGRAMS) or os.path.join(
+        os.environ.get('APPDATA', ''), 'Microsoft', 'Windows', 'Start Menu', 'Programs')
+    return os.path.join(desktop, 'Klip Kalkanı.lnk'), os.path.join(programs, 'Klip Kalkanı.lnk')
 
+
+def make_shortcut(lnk):
+    """Klip Kalkanı.exe'ye (yoksa pythonw + arayuz.pyw'ye) kısayol yapar."""
     def q(s):
         return "'" + s.replace("'", "''") + "'"
+    if os.path.exists(LAUNCHER):
+        target, arguments, icon = LAUNCHER, '', LAUNCHER + ',0'
+    else:
+        target, arguments = kk.pythonw_path(), '-E -s ' + chr(34) + os.path.abspath(__file__) + chr(34)
+        icon = ICON_PATH if os.path.exists(ICON_PATH) else ''
     script = (f"$s = (New-Object -ComObject WScript.Shell).CreateShortcut({q(lnk)}); "
-              f"$s.TargetPath = {q(kk.pythonw_path())}; "
-              f"$s.Arguments = {q('-E -s ' + chr(34) + os.path.abspath(__file__) + chr(34))}; "
-              f"$s.WorkingDirectory = {q(BASE)}; "
-              + (f"$s.IconLocation = {q(ICON_PATH)}; " if os.path.exists(ICON_PATH) else '')
-              + "$s.Description = 'Klip Kalkanı'; $s.Save()")
+              f"$s.TargetPath = {q(target)}; $s.Arguments = {q(arguments)}; $s.WorkingDirectory = {q(BASE)}; "
+              + (f"$s.IconLocation = {q(icon)}; " if icon else '')
+              + "$s.Description = 'Klip Kalkanı: oyun kliplerini Telegram\'a yedekler'; $s.Save()")
     enc = base64.b64encode(script.encode('utf-16-le')).decode()
-    subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-EncodedCommand', enc],
-                   capture_output=True, creationflags=NO_WINDOW, timeout=60)
+    r = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-EncodedCommand', enc],
+                       capture_output=True, creationflags=NO_WINDOW, timeout=60)
+    if not os.path.exists(lnk):
+        raise RuntimeError(r.stderr.decode('mbcs', 'replace').strip()[-300:] or 'kısayol oluşmadı')
     return lnk
+
+
+def make_desktop_shortcut():
+    return make_shortcut(shortcut_paths()[0])
+
+
+def remove_shortcuts():
+    """Programı kaldırırken: masaüstü ve Başlat menüsündeki Klip Kalkanı kısayolları."""
+    gone = []
+    for lnk in shortcut_paths():
+        if os.path.exists(lnk):
+            os.remove(lnk)
+            gone.append(lnk)
+    return gone
 
 
 def collect_stats():
@@ -373,8 +417,15 @@ class App(tk.Tk):
         self.update_info = None   # son güncelleme kontrolü: (zaman, başarılı mı, sonuç)
         self.update_busy = False
         self.updated_to = None    # bu pencere açıkken kurulan sürüm (pencere yeniden açılınca devreye girer)
+        self.menu_update = False  # menüden istenen kontrol: sonucu kutuyla söylenir
+        self.job = None           # menüden başlatılan Telegram işi (doğrulama / yeniden kurma)
+        self.autostart = tk.BooleanVar(value=False)  # Windows açılınca otomatik başlat (görev açık mı)
+        self.note = ttk.Label(self, text='', style='Muted.TLabel', padding=(20, 4))
+        self._note_job = None
+        self._build_menu()
         self.show(self.first_view())
         self.check_updates()
+        self._refresh_autostart()
 
     # güncelleme (GitHub): açılışta kendiliğinden, Ayarlar'daki düğmeyle elle
     def check_updates(self, manual=False):
@@ -398,6 +449,8 @@ class App(tk.Tk):
         if self.updated_to and kk._version_tuple(remote) <= kk._version_tuple(self.updated_to):
             return {'durum': 'kuruldu', 'surum': self.updated_to}
         if not kk.is_newer(remote):
+            if kk.missing_files(m):
+                kk.apply_update(m)  # sonradan eklenen program dosyası (ör. Klip Kalkanı.exe) tamamlanır
             return {'durum': 'guncel', 'uzak': remote}
         new = kk.apply_update(m)
         if kk.task_state() == 'acik' and kk.uploader_alive():
@@ -424,6 +477,12 @@ class App(tk.Tk):
             self.updated_to = val['surum']
             self._show_banner(val['surum'])
         self._notify_update()
+        if self.menu_update:
+            if ok and val is None:  # açılıştaki kontrol bakmadan döndü; menüden istenen asıl kontrol şimdi
+                self.check_updates(manual=True)
+                return
+            self.menu_update = False
+            messagebox.showinfo('Klip Kalkanı', update_result_text(self.update_info)[0])
 
     def _notify_update(self):
         fn = getattr(self.view, 'show_update_info', None)
@@ -483,6 +542,261 @@ class App(tk.Tk):
         if self.banner is not None:
             self.banner.pack_forget()
             self.banner.pack(fill='x', before=self.view)
+        on = 'normal' if isinstance(self.view, DashboardView) else 'disabled'
+        for label in ('Yedek', 'Hesap'):
+            self.menubar.entryconfigure(label, state=on)
+        for i in (0, 1):  # duraklat, otomatik başlat
+            self.m_program.entryconfigure(i, state=on)
+
+    def say(self, text, color=GREY, secs=10):
+        """Pencerenin altında kısa bilgi (menüden yapılan işler için). secs=0: kalıcı."""
+        self.note.configure(text=text, foreground=color)
+        self.note.pack(side='bottom', fill='x', before=self.view)
+        if self._note_job:
+            self.after_cancel(self._note_job)
+        self._note_job = self.after(secs * 1000, self.note.pack_forget) if secs else None
+
+    # ------------------------------------------------ menü
+    def _build_menu(self):
+        mb = self.menubar = tk.Menu(self, tearoff=False)
+        self.config(menu=mb)
+        m = self.m_program = tk.Menu(mb, tearoff=False, postcommand=self._program_menu_opening)
+        mb.add_cascade(label='Program', menu=m)
+        m.add_command(label='Yedeklemeyi duraklat', command=self.menu_pause)
+        m.add_checkbutton(label='Windows açılınca otomatik başlat', variable=self.autostart,
+                          command=self.toggle_autostart)
+        m.add_separator()
+        m.add_command(label='Masaüstüne kısayol koy', command=lambda: self.menu_shortcut(0))
+        m.add_command(label='Başlat menüsüne ekle', command=lambda: self.menu_shortcut(1))
+        m.add_separator()
+        m.add_command(label='Program klasörünü aç', command=lambda: os.startfile(BASE))
+        m.add_command(label='Ayar klasörünü aç', command=self.menu_open_data)
+        m.add_command(label='Günlüğü aç', command=self.menu_open_log)
+        m.add_separator()
+        m.add_command(label='Programı kaldır…', command=self.menu_uninstall)
+        m.add_command(label='Pencereyi kapat', command=self.destroy)
+        m = tk.Menu(mb, tearoff=False)
+        mb.add_cascade(label='Yedek', menu=m)
+        m.add_command(label='Klasörleri şimdi tara', command=self.menu_scan)
+        m.add_command(label="Telegram'daki yedekleri doğrula", command=self.menu_verify)
+        m.add_command(label="Kayıtları Telegram'dan yeniden kur…", command=self.menu_reindex)
+        m.add_separator()
+        m.add_command(label="Arşiv grubunu Telegram'da aç", command=lambda: self._on_dashboard('open_telegram'))
+        m = self.m_account = tk.Menu(mb, tearoff=False, postcommand=self._account_menu_opening)
+        mb.add_cascade(label='Hesap', menu=m)
+        m.add_command(label='Telegram hesabı', state='disabled')
+        m.add_separator()
+        m.add_command(label="Telegram'dan çıkış yap…", command=lambda: self._on_dashboard('logout'))
+        m = tk.Menu(mb, tearoff=False)
+        mb.add_cascade(label='Yardım', menu=m)
+        m.add_command(label='Güncellemeleri kontrol et', command=self.menu_check_updates)
+        m.add_command(label='Sürüm notları', command=lambda: webbrowser.open(
+            f'https://github.com/{kk.GUNCELLEME_REPO}/releases'))
+        m.add_command(label='Nasıl kullanılır', command=self.menu_help)
+        m.add_separator()
+        m.add_command(label='Hakkında', command=self.menu_about)
+
+    def _on_dashboard(self, method):
+        if isinstance(self.view, DashboardView):
+            getattr(self.view, method)()
+
+    def _program_menu_opening(self):
+        if isinstance(self.view, DashboardView):
+            paused = bool(kk.load_config().get('duraklat')) or not kk.uploader_alive()
+            self.m_program.entryconfigure(0, label='Yedeklemeye devam et' if paused else 'Yedeklemeyi duraklat')
+
+    def _account_menu_opening(self):
+        h = kk.load_config().get('hesap')
+        self.m_account.entryconfigure(0, label=account_text(h) if h else 'Telegram hesabı')
+
+    def menu_pause(self):
+        self._on_dashboard('toggle_pause')
+
+    # otomatik başlatma (menüde ve Ayarlar sekmesinde aynı anahtar)
+    def _refresh_autostart(self):
+        self.bg(kk.task_state, self._autostart_state)
+        self.after(20000, self._refresh_autostart)
+
+    def _autostart_state(self, res):
+        ok, state = res
+        if ok:
+            self.autostart.set(state == 'acik')
+
+    def toggle_autostart(self):
+        if self.autostart.get():
+            self.bg(self._autostart_on, self._autostart_done)
+            return
+        if not messagebox.askyesno('Klip Kalkanı', 'Otomatik başlatma kapatılsın mı?\n\nArka plandaki yedekleme '
+                                   'durur ve Windows açılınca kendiliğinden başlamaz. Tekrar açmak için yine buradan '
+                                   'ya da Durum sekmesindeki "Devam et"ten açabilirsin.'):
+            self.autostart.set(True)
+            return
+        self.bg(kk.stop_backup, self._autostart_done)
+
+    @staticmethod
+    def _autostart_on():
+        if kk.task_state() == 'yok':
+            kk.register_task()
+        else:
+            kk.start_task()
+
+    def _autostart_done(self, res):
+        ok, val = res
+        if not ok:
+            messagebox.showerror('Klip Kalkanı', f'Olmadı: {val}')
+        self.bg(kk.task_state, self._autostart_state)
+        if isinstance(self.view, DashboardView):
+            self.view._ts = (0, 'acik')  # durum yazısı hemen tazelensin
+        self.say('✔ Otomatik başlatma açıldı.' if self.autostart.get() else 'Otomatik başlatma kapatıldı.')
+
+    def menu_shortcut(self, which):
+        lnk = shortcut_paths()[which]
+
+        def done(res):
+            ok, val = res
+            self.say('✔ Kısayol kondu: ' + val if ok else f'Kısayol konamadı: {val}', GREEN if ok else RED)
+        self.bg(make_shortcut, done, lnk)
+
+    def menu_open_data(self):
+        os.makedirs(kk.DATA_DIR, exist_ok=True)
+        os.startfile(kk.DATA_DIR)
+
+    def menu_open_log(self):
+        p = os.path.join(kk.LOG_DIR, 'klip_kalkani.log')
+        if os.path.exists(p):
+            os.startfile(p)
+        elif os.path.isdir(kk.LOG_DIR):
+            os.startfile(kk.LOG_DIR)
+        else:
+            self.say('Henüz günlük yok; arka plan ilk çalıştığında yazılır.')
+
+    # yedek işleri
+    def _busy(self):
+        if self.job is not None and not self.job.done():
+            self.say('Başka bir iş sürüyor, bitmesini bekle.', ORANGE)
+            return True
+        return False
+
+    def menu_scan(self):
+        self.say('Klasörler taranıyor…', secs=0)
+        self.bg(self._scan, self._scanned)
+
+    @staticmethod
+    def _scan():
+        res = kk.scan(kk.load_config())
+        if kk.uploader_alive():
+            kk.request_scan()  # arka plan da sırasını tazelesin
+        return res
+
+    def _scanned(self, res):
+        ok, st = res
+        if not ok:
+            self.say(f'Taranamadı: {st}', RED)
+            return
+        text = f'✔ Tarandı: {kk.fmt_count(st["found"])} klip, {st["new"]} yeni, {st["changed"]} değişmiş.'
+        if st['unavailable']:
+            text += '  Ulaşılamayan: ' + ', '.join(st['unavailable'][:3])
+        self.say(text, ORANGE if st['unavailable'] else GREEN, secs=20)
+        if isinstance(self.view, DashboardView):
+            self.view.refresh_now()
+
+    def menu_verify(self):
+        if self._busy():
+            return
+        self.say("Telegram'daki yedekler kontrol ediliyor…", secs=0)
+
+        def progress(i, n):
+            self.post(self.say, f'Kontrol ediliyor… {kk.fmt_count(i)} / {kk.fmt_count(n)} parça', GREY, 0)
+        self.job = self.async_.run(kk.verify_archive(kk.load_config(), progress), self._verified)
+
+    def _verified(self, fut):
+        try:
+            total, bad = fut.result()
+        except Exception as e:
+            self.say(f'Doğrulanamadı: {friendly_error(e)}', RED, secs=0)
+            return
+        if bad:
+            self.say(f"{kk.fmt_count(total)} parçadan {bad} tanesi Telegram'da eksik/bozuk çıktı; tekrar yüklenecek.",
+                     ORANGE, secs=0)
+        else:
+            self.say(f"✔ {kk.fmt_count(total)} parçanın hepsi Telegram'da sağlam duruyor.", GREEN, secs=30)
+
+    def menu_reindex(self):
+        if self._busy() or not messagebox.askyesno(
+                'Klip Kalkanı', "Kayıtlar Telegram'daki arşivden yeniden okunsun mu?\n\nBilgisayar değiştiyse ya da "
+                "program neyin yüklendiğini unuttuysa işe yarar. Telegram'da zaten olan klipler tekrar yüklenmez. "
+                'Klip sayısına göre birkaç dakika sürebilir.'):
+            return
+        self.say("Telegram'daki arşiv okunuyor…", secs=0)
+        self.job = self.async_.run(kk.reindex(kk.load_config()), self._reindexed)
+
+    def _reindexed(self, fut):
+        try:
+            found, complete = fut.result()
+        except Exception as e:
+            self.say(f'Olmadı: {friendly_error(e)}', RED, secs=0)
+            return
+        self.say(f"✔ Telegram'da {kk.fmt_count(found)} klip bulundu, {kk.fmt_count(complete)} tanesi eksiksiz; "
+                 'kayıtlar güncellendi.', GREEN, secs=30)
+        if isinstance(self.view, DashboardView):
+            self.view.refresh_now()
+
+    # kaldırma
+    def menu_uninstall(self):
+        view = self.view
+        if isinstance(view, DashboardView) and view.restore_future and not view.restore_future.done():
+            messagebox.showinfo('Klip Kalkanı', 'Önce Geri Yükle sekmesindeki indirmeyi durdur.')
+            return
+        if not messagebox.askyesno('Klip Kalkanı', 'Klip Kalkanı bu bilgisayardan kaldırılsın mı?\n\n'
+                                   '• Arka plandaki yedekleme durur, otomatik başlatma silinir.\n'
+                                   '• Masaüstü ve Başlat menüsü kısayolları kaldırılır.\n'
+                                   '• Telegram\'daki yedeklere ve bilgisayardaki kliplere dokunulmaz.', icon='warning'):
+            return
+        logout = os.path.exists(kk.SESSION_FILE) and messagebox.askyesno(
+            'Klip Kalkanı', 'Bu bilgisayardaki Telegram girişi de kapatılsın mı?\n\n(Önerilir. Telegram\'daki '
+                            'klipler yine silinmez; tekrar kurarsan yeniden giriş yaparsın.)')
+        self.say('Kaldırılıyor…', secs=0)
+        self.bg(self._uninstall, self._uninstalled, logout)
+
+    @staticmethod
+    def _uninstall(logout):
+        kk.stop_uploader()
+        kk.remove_task()
+        gone = remove_shortcuts()
+        if logout:
+            asyncio.run(kk.telegram_logout())
+        return gone
+
+    def _uninstalled(self, res):
+        ok, val = res
+        if not ok:
+            self.say(f'Kaldırılamadı: {val}', RED, secs=0)
+            return
+        messagebox.showinfo('Klip Kalkanı', 'Kaldırıldı: arka plan durdu, otomatik başlatma ve kısayollar silindi.\n\n'
+                                            f'Program klasörünü istersen şimdi silebilirsin:\n{BASE}\n\n'
+                                            'Ayarlar ve yedek kayıtları şurada duruyor; tekrar kurarsan kaldığı yerden '
+                                            f'devam eder. Tamamen temizlemek istersen bunu da silebilirsin:\n{kk.DATA_DIR}')
+        self.destroy()
+
+    # yardım
+    def menu_check_updates(self):
+        self.menu_update = True
+        self.check_updates(manual=True)  # zaten bakılıyorsa sonuç gelince söylenir
+
+    @staticmethod
+    def menu_help():
+        readme = os.path.join(BASE, 'BENİ OKU.txt')
+        if os.path.exists(readme):
+            os.startfile(readme)
+        else:
+            webbrowser.open(f'https://github.com/{kk.GUNCELLEME_REPO}#readme')
+
+    @staticmethod
+    def menu_about():
+        messagebox.showinfo('Klip Kalkanı', f'Klip Kalkanı {kk.VERSION}\n\nOyun kliplerini Telegram\'da sadece senin '
+                                            'göreceğin gizli bir gruba yedekler. Hiçbir dosyayı silmez.\n\n'
+                                            f'Program: {BASE}\nAyarlar: {kk.DATA_DIR}\n\n'
+                                            f'github.com/{kk.GUNCELLEME_REPO}')
 
 
 # ---------------------------------------------------------------- Telegram girişi
@@ -728,6 +1042,17 @@ class SetupView(ttk.Frame):
         ttk.Label(self, text='Oyun kliplerin Telegram\'da sadece senin göreceğin gizli bir gruba otomatik yedeklenir. '
                              'Hiçbir dosya silinmez.', style='Muted.TLabel', wraplength=900).pack(anchor='w', pady=(2, 12))
 
+        # önceki kurulum (başka klasörde, 1.7 öncesi): ayarlarını al, kurulum gerekmesin
+        old = kk.old_install()
+        if old and not kk._same(old, BASE):
+            box = ttk.LabelFrame(self, text=' Önceki kurulum bulundu ', padding=12)
+            box.pack(fill='x', pady=(0, 12))
+            ttk.Label(box, text=f'Bu bilgisayarda daha önce kurulmuş bir Klip Kalkanı var: {old}\nAyarlarını, Telegram '
+                                'girişini ve yedek kayıtlarını buraya alırsan kurulum gerekmez; kaldığı yerden devam '
+                                'eder.', wraplength=880, justify='left').pack(anchor='w')
+            ttk.Button(box, text='Ayarlarımı buraya al', style='Accent.TButton',
+                       command=lambda: self.adopt(old)).pack(anchor='w', pady=(8, 0))
+
         # 0) API bilgisi (sadece paketle gelmediyse sorulur)
         cfg = kk.load_config()
         self.need_api = not (cfg.get('api_id') and cfg.get('api_hash'))
@@ -789,7 +1114,9 @@ class SetupView(ttk.Frame):
         bottom = ttk.Frame(self)
         bottom.pack(fill='x', pady=(16, 0))
         self.shortcut = tk.BooleanVar(value=True)
+        self.start_menu = tk.BooleanVar(value=True)
         ttk.Checkbutton(bottom, text='Masaüstüne kısayol koy', variable=self.shortcut).pack(side='left')
+        ttk.Checkbutton(bottom, text='Başlat menüsüne ekle', variable=self.start_menu).pack(side='left', padx=(12, 0))
         self.finish_btn = ttk.Button(bottom, text='Kurulumu bitir', style='Accent.TButton', command=self.finish,
                                      state='disabled')
         self.finish_btn.pack(side='right')
@@ -897,14 +1224,38 @@ class SetupView(ttk.Frame):
             self.finish_msg.configure(text=friendly_error(e))
             return
         self.finish_msg.configure(text='Otomatik başlatma kuruluyor…')
-        self.app.bg(self._install, self._installed, self.shortcut.get())
+        self.app.bg(self._install, self._installed, self.shortcut.get(), self.start_menu.get())
 
     @staticmethod
-    def _install(shortcut):
+    def _install(desktop, start_menu):
         kk.register_task()
-        if shortcut:
-            make_desktop_shortcut()
+        for want, lnk in zip((desktop, start_menu), shortcut_paths()):
+            if want:
+                make_shortcut(lnk)
         return True
+
+    # --- başka klasördeki eski kurulum
+    def adopt(self, old):
+        if not messagebox.askyesno('Klip Kalkanı', f'{old} klasöründeki ayarlar, Telegram girişi ve yedek kayıtları '
+                                   'ayar klasörüne taşınsın ve arka plan bundan sonra bu kopyadan çalışsın mı?\n\n'
+                                   'Eski klasördeki program dosyalarına dokunulmaz; sonra istersen silebilirsin.'):
+            return
+        self.app.bg(self._adopt, self._adopted, old)
+
+    @staticmethod
+    def _adopt(old):
+        kk.adopt_old_install(old)
+        for lnk in shortcut_paths():  # eski klasörü gösteren kısayollar buraya dönsün
+            if os.path.exists(lnk):
+                make_shortcut(lnk)
+        return True
+
+    def _adopted(self, res):
+        ok, val = res
+        if not ok:
+            messagebox.showerror('Klip Kalkanı', f'Ayarlar alınamadı:\n{val}')
+            return
+        self.app.show(self.app.first_view())
 
     def _installed(self, res):
         ok, val = res
@@ -1158,10 +1509,13 @@ class DashboardView(ttk.Frame):
                                      + (f'  ·  parça {part}' if part != '1/1' else ''))
 
     def _refresh_stats(self):
+        self.refresh_now()
+        self._stats_job = self.after(15000, self._refresh_stats)
+
+    def refresh_now(self):
         if not self.stats_busy:
             self.stats_busy = True
             self.app.bg(collect_stats, self._stats_ready)
-        self._stats_job = self.after(15000, self._refresh_stats)
 
     def _stats_ready(self, res):
         self.stats_busy = False
@@ -1450,6 +1804,15 @@ class DashboardView(ttk.Frame):
         if h:
             self._show_account(h)
 
+        box = ttk.LabelFrame(t, text=' Başlangıç ', padding=12)
+        box.pack(fill='x', pady=(14, 0))
+        ttk.Checkbutton(box, text='Windows açılınca otomatik başlat (yedekleme arka planda sürer)',
+                        variable=self.app.autostart, command=self.app.toggle_autostart).pack(anchor='w')
+        r = ttk.Frame(box)
+        r.pack(fill='x', pady=(8, 0))
+        ttk.Label(r, text=f'Ayarların yeri: {kk.DATA_DIR}', style='Muted.TLabel').pack(side='left')
+        ttk.Button(r, text='Aç', command=self.app.menu_open_data).pack(side='left', padx=8)
+
         box = ttk.LabelFrame(t, text=' Güncelleme ', padding=12)
         box.pack(fill='x', pady=(14, 0))
         r = ttk.Frame(box)
@@ -1549,20 +1912,7 @@ class DashboardView(ttk.Frame):
         if self.app.update_info is None:
             self.upd_msg.configure(text='')
             return
-        when, ok, val = self.app.update_info
-        at = dt.datetime.fromtimestamp(when).strftime('%H:%M')
-        if not ok:
-            text, color = f'Kontrol edilemedi ({at}): {update_error_text(val)}', ORANGE
-        elif val['durum'] == 'guncel':
-            text, color = f'✔ Güncelsin, en son sürüm bu. (Son kontrol {at})', GREEN
-        elif val['durum'] == 'kuruldu':
-            text, color = (f'✔ {val["surum"]} sürümü indirildi ve kuruldu. Yukarıdaki "Yeni sürümü aç"a basınca '
-                           'geçer.'), GREEN
-        elif val['durum'] == 'gelistirici':
-            text, color = (f'Bu bir geliştirici kopyası (git), kendini güncellemez. GitHub\'daki son sürüm: '
-                           f'{val["uzak"]}. (Son kontrol {at})'), GREY
-        else:
-            text, color = 'Otomatik güncelleme bu kopyada kapalı.', GREY
+        text, color = update_result_text(self.app.update_info)
         self.upd_msg.configure(text=text, foreground=color)
 
     # ------------------------------------------------ Geri Yükle
@@ -1819,6 +2169,10 @@ def main():
         ctypes.windll.shcore.SetProcessDpiAwareness(1)  # yüksek çözünürlükte bulanık olmasın
     except Exception:
         pass
+    try:  # 1.7 öncesi kurulum: ayarlar, giriş ve kayıtlar program klasöründen %APPDATA%\KlipKalkani'ye
+        kk.migrate_data(stop_running=True)
+    except Exception as e:
+        print('Veriler taşınamadı, eski yerden devam:', e)
     app = App()
     view = app.view if isinstance(app.view, DashboardView) else None
     if view and '--sekme' in sys.argv:

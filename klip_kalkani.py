@@ -14,6 +14,9 @@ Komutlar (.venv\\Scripts\\python.exe klip_kalkani.py <komut>):
   kaldir                Otomatik başlatmayı kaldır
 
 Hiçbir komut bilgisayardaki klipleri silmez, taşımaz veya değiştirmez. Kanala sadece ekleme yapılır.
+
+Ayarlar, Telegram girişi, veritabanı ve günlükler %APPDATA%\\KlipKalkani'de durur; program başka bir klasöre
+açılsa ya da güncellense de kaybolmaz. (1.7'den önce program klasöründeydi; ilk açılışta oraya taşınır.)
 """
 
 import argparse
@@ -24,6 +27,7 @@ import ctypes
 import datetime as dt
 import fnmatch
 import getpass
+import glob
 import hashlib
 import html
 import io
@@ -34,6 +38,7 @@ import mimetypes
 import os
 import random
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -41,15 +46,36 @@ import time
 
 import psutil
 
-VERSION = '1.6'
-BASE = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE, 'ayarlar.json')
-DB_PATH = os.path.join(BASE, 'klip_kalkani.db')
-SESSION_BASE = os.path.join(BASE, 'klip_kalkani')  # Telethon sonuna .session ekler
-SESSION_FILE = SESSION_BASE + '.session'
-LOGIN_SESSION_BASE = SESSION_BASE + '-giris'  # pencereden giriş sürerken; bitince SESSION_FILE olur
-STATUS_PATH = os.path.join(BASE, 'durum.json')
-LOG_DIR = os.path.join(BASE, 'log')
+VERSION = '1.7'
+BASE = os.path.dirname(os.path.abspath(__file__))  # program dosyaları
+APPDATA_DIR = os.path.join(os.environ.get('APPDATA') or os.path.join(os.path.expanduser('~'), 'AppData', 'Roaming'),
+                           'KlipKalkani')
+# program klasöründen %APPDATA%'ya taşınan kullanıcı verisi (veritabanı, log ve ayarlar.json ayrıca taşınır)
+DATA_PATTERNS = ('klip_kalkani*.session*', 'klip_kalkani.*.db', 'durum.json')
+
+
+def set_data_dir(d):
+    """Kullanıcı verisinin (ayarlar, giriş, veritabanı, durum, günlük) durduğu klasör."""
+    global DATA_DIR, CONFIG_PATH, DB_PATH, SESSION_BASE, SESSION_FILE, LOGIN_SESSION_BASE, STATUS_PATH, LOG_DIR
+    global SCAN_REQUEST
+    DATA_DIR = d
+    CONFIG_PATH = os.path.join(d, 'ayarlar.json')
+    DB_PATH = os.path.join(d, 'klip_kalkani.db')
+    SESSION_BASE = os.path.join(d, 'klip_kalkani')  # Telethon sonuna .session ekler
+    SESSION_FILE = SESSION_BASE + '.session'
+    LOGIN_SESSION_BASE = SESSION_BASE + '-giris'  # pencereden giriş sürerken; bitince SESSION_FILE olur
+    STATUS_PATH = os.path.join(d, 'durum.json')
+    LOG_DIR = os.path.join(d, 'log')
+    SCAN_REQUEST = os.path.join(d, 'tara.istek')  # pencere "şimdi tara" deyince yükleyici hemen tarar
+
+
+def _same(a, b):
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+# Veri %APPDATA%'da; henüz taşınmamış eski bir kurulumun verisi program klasöründeyse (taşınana kadar) oradan.
+set_data_dir(BASE if (not os.path.exists(os.path.join(APPDATA_DIR, 'ayarlar.json'))
+                      and os.path.exists(os.path.join(BASE, 'ayarlar.json'))) else APPDATA_DIR)
 
 PART_SIZE = 512 * 1024                 # Telegram'ın kabul ettiği en büyük parça
 SMALL_FILE = 10 * 1024 * 1024          # bunun altı saveFilePart ile gider
@@ -235,6 +261,7 @@ def save_config(cfg):
 
 
 def write_json_atomic(path, data, indent=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=indent)
@@ -250,6 +277,7 @@ def read_json(path, default=None):
 
 
 def open_db():
+    os.makedirs(DATA_DIR, exist_ok=True)
     db = sqlite3.connect(DB_PATH, timeout=60)
     db.row_factory = sqlite3.Row
     db.execute('PRAGMA journal_mode=WAL')
@@ -492,14 +520,18 @@ def alert(db, key, title, text, every_hours=12):
 
 
 _mutex = None
+_mutex_ok = None
 
 
 def single_instance():
-    global _mutex
-    k32 = ctypes.WinDLL('kernel32', use_last_error=True)
-    k32.CreateMutexW.restype = ctypes.c_void_p
-    _mutex = k32.CreateMutexW(None, False, 'Local\\KlipKalkaniCalis')
-    return ctypes.get_last_error() != 183  # ERROR_ALREADY_EXISTS
+    """Arka plan yükleyicisinden tek kopya çalışsın. Aynı süreçte tekrar çağrılınca ilk sonucu döndürür."""
+    global _mutex, _mutex_ok
+    if _mutex_ok is None:
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        _mutex = k32.CreateMutexW(None, False, 'Local\\KlipKalkaniCalis')
+        _mutex_ok = ctypes.get_last_error() != 183  # ERROR_ALREADY_EXISTS
+    return _mutex_ok
 
 
 def setup_logging(filename, console):
@@ -582,7 +614,7 @@ def scan(cfg):
                 k = known.get(p)
                 game, taken = detect_game_date(p, st.st_mtime, pretty, rules)
                 if k is None:
-                    db.execute('INSERT INTO files(path, size, mtime, fp, source, prio, game, taken, seen) '
+                    db.execute('INSERT OR IGNORE INTO files(path, size, mtime, fp, source, prio, game, taken, seen) '
                                'VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?)',
                                (p, st.st_size, st.st_mtime, root, prio, game, taken, start))
                     new += 1
@@ -635,6 +667,7 @@ def build_queue(db, cfg, since):
 
 def new_client(session, cfg, **kw):
     from telethon import TelegramClient
+    os.makedirs(DATA_DIR, exist_ok=True)
     return TelegramClient(session, int(cfg['api_id']), cfg['api_hash'], device_model='Klip Kalkani',
                           system_version='Windows', app_version=VERSION, lang_code='tr', system_lang_code='tr',
                           receive_updates=False, **kw)
@@ -1103,12 +1136,14 @@ async def process_item(ctx, row, deadline):
         return 'error'
 
 
-async def verify(ctx, fix=True):
+async def verify(ctx, fix=True, progress=None):
     """Kanalda her parçanın hâlâ durduğunu ve boyutunun doğru olduğunu kontrol eder."""
     db = ctx.db
     rows = db.execute('SELECT fp, idx, msg_id, length FROM parts ORDER BY msg_id').fetchall()
     bad = []
     for i in range(0, len(rows), 100):
+        if progress:
+            progress(i, len(rows))
         batch = rows[i:i + 100]
         msgs = await ctx.client.get_messages(ctx.channel, ids=[r['msg_id'] for r in batch])
         for r, m in zip(batch, msgs):
@@ -1281,7 +1316,7 @@ def pythonw_path():
     return pyw if os.path.exists(pyw) else sys.executable
 
 
-def register_task():
+def register_task(start=True):
     """Windows açılınca (ve yarım saatte bir kontrol ederek) arka planda çalışan görevi kurar ve başlatır."""
     from xml.sax.saxutils import escape
     user = '\\'.join(filter(None, [os.environ.get('USERDOMAIN'), os.environ.get('USERNAME')]))
@@ -1337,7 +1372,8 @@ def register_task():
         os.remove(path)
     if r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout).strip())
-    start_task()
+    if start:
+        start_task()
 
 
 def task_state():
@@ -1358,6 +1394,29 @@ def start_task():
     subprocess.run(['schtasks', '/Run', '/TN', TASK_NAME], capture_output=True, creationflags=0x08000000)
 
 
+def run_task():
+    """Görevi şimdi çalıştırır (kapalıysa açmaz)."""
+    subprocess.run(['schtasks', '/Run', '/TN', TASK_NAME], capture_output=True, creationflags=0x08000000)
+
+
+def remove_task():
+    """Otomatik başlatmayı tamamen siler (programı kaldırırken)."""
+    subprocess.run(['schtasks', '/End', '/TN', TASK_NAME], capture_output=True, creationflags=0x08000000)
+    r = subprocess.run(['schtasks', '/Delete', '/TN', TASK_NAME, '/F'], capture_output=True, creationflags=0x08000000)
+    return r.returncode == 0
+
+
+def task_folder():
+    """Görevin çalıştırdığı program klasörü (başka klasördeki eski kurulumu bulmak için)."""
+    r = subprocess.run(['schtasks', '/Query', '/TN', TASK_NAME, '/XML'], capture_output=True, creationflags=0x08000000)
+    if r.returncode != 0:
+        return None
+    b = r.stdout
+    text = html.unescape(b.decode('utf-16') if b[:2] in (b'\xff\xfe', b'\xfe\xff') else b.decode('mbcs', 'replace'))
+    m = re.search(r'<Arguments>[^<]*?"([^"<]+?klip_kalkani\.py)"', text, re.I)
+    return os.path.dirname(m.group(1)) if m else None
+
+
 def restart_task():
     """Arka plandaki yükleyiciyi kapatıp yeniden başlatır (diskteki yeni kodla açılsın diye)."""
     subprocess.run(['schtasks', '/End', '/TN', TASK_NAME], capture_output=True, creationflags=0x08000000)
@@ -1367,7 +1426,7 @@ def restart_task():
 # ---------------------------------------------------------------- otomatik güncelleme (GitHub)
 
 GUNCELLEME_REPO = 'GroundPower/klip-kalkani'  # herkese açık repo; boş bırakılırsa güncelleme kapalı
-GUNCELLENEN_DOSYALAR = ('klip_kalkani.py', 'arayuz.pyw', 'duzenle.py', 'kalkan.ico')
+GUNCELLENEN_DOSYALAR = ('klip_kalkani.py', 'arayuz.pyw', 'duzenle.py', 'kalkan.ico', 'Klip Kalkanı.exe')
 
 
 def _version_tuple(v):
@@ -1396,13 +1455,26 @@ def fetch_manifest():
     return json.loads(_http_get(url))
 
 
+def missing_files(m):
+    """Sürüm aynı ama sonradan eklenen bir program dosyası (ör. Klip Kalkanı.exe) bu kurulumda yok mu?"""
+    return [n for n in m['dosyalar'] if n in GUNCELLENEN_DOSYALAR and not os.path.exists(os.path.join(BASE, n))]
+
+
 def check_update():
-    """GitHub'da daha yeni sürüm varsa bilgisini (surum.json) döndürür, yoksa None.
+    """GitHub'da daha yeni sürüm (ya da eksik program dosyası) varsa bilgisini (surum.json) döndürür, yoksa None.
     Geliştirme kopyasında (.git klasörü olan yerde) bakmaz."""
     if not GUNCELLEME_REPO or is_dev_copy():
         return None
     m = fetch_manifest()
-    return m if is_newer(m['surum']) else None
+    return m if is_newer(m['surum']) or missing_files(m) else None
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 20), b''):
+            h.update(block)
+    return h.hexdigest()
 
 
 def apply_update(m):
@@ -1411,6 +1483,7 @@ def apply_update(m):
     missing = [mod for mod in m.get('gereken_moduller', []) if importlib.util.find_spec(mod) is None]
     if missing:
         raise RuntimeError('Yeni sürüm ek paket istiyor (' + ', '.join(missing) + '); zip\'i yeniden indir.')
+    import urllib.parse
     tag = m.get('etiket') or f"v{m['surum']}"
     tmp = os.path.join(BASE, 'guncelleme')
     os.makedirs(tmp, exist_ok=True)
@@ -1418,7 +1491,10 @@ def apply_update(m):
     for name, sha in m['dosyalar'].items():
         if name not in GUNCELLENEN_DOSYALAR:  # sadece bilinen program dosyaları güncellenir
             continue
-        data = _http_get(f'https://raw.githubusercontent.com/{GUNCELLEME_REPO}/{tag}/{name}')
+        dst = os.path.join(BASE, name)
+        if os.path.exists(dst) and file_sha256(dst) == sha:  # bu dosya değişmemiş
+            continue
+        data = _http_get(f'https://raw.githubusercontent.com/{GUNCELLEME_REPO}/{tag}/{urllib.parse.quote(name)}')
         if hashlib.sha256(data).hexdigest() != sha:
             raise RuntimeError(f'{name} doğrulanamadı (özet tutmuyor), güncelleme yapılmadı')
         if name.endswith(('.py', '.pyw')):
@@ -1432,9 +1508,12 @@ def apply_update(m):
     for name, path in got.items():
         dst = os.path.join(BASE, name)
         if os.path.exists(dst):
-            import shutil
             shutil.copy2(dst, os.path.join(backup, name))
-        os.replace(path, dst)
+        try:
+            os.replace(path, dst)
+        except PermissionError:  # o an açık olan exe'nin üstüne yazılamaz ama adı değiştirilebilir
+            os.replace(dst, dst + '.eski')
+            os.replace(path, dst)
     try:
         os.rmdir(tmp)
     except OSError:
@@ -1454,8 +1533,8 @@ def restart_uploader():
     os._exit(0)
 
 
-def uploader_alive():
-    s = read_json(STATUS_PATH, {}) or {}
+def uploader_alive(status_path=None):
+    s = read_json(status_path or STATUS_PATH, {}) or {}
     pid = s.get('pid')
     if not pid or not psutil.pid_exists(pid) or time.time() - s.get('zaman', 0) > 180:
         return False
@@ -1465,11 +1544,11 @@ def uploader_alive():
         return False
 
 
-def stop_uploader(wait=20):
+def stop_uploader(wait=20, status_path=None):
     """Arka plandaki yükleyiciyi kapatır. Görev açık kalırsa yarım saatlik kontrolde yine başlar;
     tamamen durması için disable_task() da gerekir."""
     subprocess.run(['schtasks', '/End', '/TN', TASK_NAME], capture_output=True, creationflags=0x08000000)
-    pid = (read_json(STATUS_PATH, {}) or {}).get('pid')
+    pid = (read_json(status_path or STATUS_PATH, {}) or {}).get('pid')
     if not pid:
         return
     try:
@@ -1677,6 +1756,95 @@ async def telegram_logout(prepare=None):
         await asyncio.to_thread(prepare)
 
 
+def _has_install(d):
+    """Bu klasörde kurulumu bitmiş (arşiv grubu ve klip klasörleri belli) Klip Kalkanı verisi var mı?"""
+    cfg = read_json(os.path.join(d, 'ayarlar.json'), {}) or {}
+    return bool(cfg.get('kanal_id') and cfg.get('kaynaklar'))
+
+
+def old_install(other_folders=True):
+    """%APPDATA%'da henüz kurulu veri yokken, 1.7 öncesi bir kurulumun verisi nerede? (Önce bu program klasörü,
+    sonra görevin çalıştırdığı klasör.) Yoksa None."""
+    if _has_install(APPDATA_DIR):
+        return None
+    candidates = [BASE] + ([task_folder()] if other_folders else [])
+    for d in candidates:
+        if d and not _same(d, APPDATA_DIR) and os.path.exists(os.path.join(d, 'ayarlar.json')):
+            return d
+    return None
+
+
+def migrate_data(source=None, stop_running=False):
+    """Eski kurulumun ayarlarını, Telegram girişini, veritabanını ve günlüklerini %APPDATA%\\KlipKalkani'ye taşır.
+    Önce hepsi kopyalanır (veritabanı SQLite yedeklemesiyle), ayarlar.json en son; ancak ondan sonra eskiler
+    kaldırılır. Kopyalama yarıda kalırsa hiçbir şey değişmez, eski yerden devam edilir. Dönüş: taşındıysa True."""
+    src = source or old_install(other_folders=False)
+    if not src or _has_install(APPDATA_DIR):  # yarım kalmış yeni kurulum (ör. sadece API bilgisi) üstüne yazılır
+        return False
+    status = os.path.join(src, 'durum.json')
+    was_running = stop_running and uploader_alive(status)
+    if was_running:  # eski kodla çalışan yükleyici veritabanını açık tutuyor
+        stop_uploader(status_path=status)
+    try:
+        new = APPDATA_DIR
+        os.makedirs(new, exist_ok=True)
+        moved = []
+        src_db = os.path.join(src, 'klip_kalkani.db')
+        if os.path.exists(src_db):
+            s = sqlite3.connect(src_db, timeout=60)
+            d = sqlite3.connect(os.path.join(new, 'klip_kalkani.db'))
+            try:
+                s.backup(d)
+            finally:
+                d.close()
+                s.close()
+            moved += [src_db + x for x in ('', '-wal', '-shm')]
+        for pattern in DATA_PATTERNS:
+            for f in glob.glob(os.path.join(src, pattern)):
+                shutil.copy2(f, os.path.join(new, os.path.basename(f)))
+                moved.append(f)
+        if os.path.isdir(os.path.join(src, 'log')):
+            shutil.copytree(os.path.join(src, 'log'), os.path.join(new, 'log'), dirs_exist_ok=True)
+            moved.append(os.path.join(src, 'log'))
+        shutil.copy2(os.path.join(src, 'ayarlar.json'), os.path.join(new, 'ayarlar.json'))  # en son: taşıma tamam
+        moved.append(os.path.join(src, 'ayarlar.json'))
+        set_data_dir(new)
+        for f in moved:  # kopyaları yeni yerde; eski yerdekiler kaldırılır
+            try:
+                if os.path.isdir(f):
+                    shutil.rmtree(f)
+                elif os.path.exists(f):
+                    os.remove(f)
+            except OSError as e:
+                log.warning('Eski dosya kaldırılamadı: %s (%s)', f, e)
+    finally:
+        if was_running and task_state() == 'acik':
+            run_task()
+    return True
+
+
+def adopt_old_install(src):
+    """Başka klasördeki eski kurulumun verisini alır ve otomatik başlatmayı bu klasöre çevirir (açık/kapalı durumu
+    korunur). Pencerenin kurulum ekranındaki "buraya al" düğmesi."""
+    state = task_state()
+    if not migrate_data(src, stop_running=True):
+        raise RuntimeError('taşınacak ayar bulunamadı')
+    if state != 'yok':
+        stop_uploader()
+        register_task(start=False)
+        if state == 'kapali':
+            disable_task()
+        elif not load_config().get('duraklat'):
+            run_task()
+
+
+def request_scan():
+    """Arka plandaki yükleyiciye "hemen tara" der (sıradaki dosyadan önce, en geç bir dakikada tarar)."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(SCAN_REQUEST, 'w', encoding='utf-8') as f:
+        f.write(str(time.time()))
+
+
 def stop_backup():
     """Yükleyiciyi ve otomatik başlatmayı kapatır (çıkış yaparken)."""
     stop_uploader()
@@ -1693,10 +1861,7 @@ async def cmd_logout():
 
 
 def cmd_uninstall():
-    subprocess.run(['schtasks', '/End', '/TN', TASK_NAME], capture_output=True, creationflags=0x08000000)
-    r = subprocess.run(['schtasks', '/Delete', '/TN', TASK_NAME, '/F'], capture_output=True,
-                       creationflags=0x08000000)
-    print('Otomatik başlatma kaldırıldı.' if r.returncode == 0 else 'Otomatik başlatma zaten kurulu değil.')
+    print('Otomatik başlatma kaldırıldı.' if remove_task() else 'Otomatik başlatma zaten kurulu değil.')
     print("Bilgisayardaki dosyalara ve Telegram'daki yedeklere dokunulmadı.")
 
 
@@ -1757,6 +1922,12 @@ async def upload_loop(client, cfg, db, status, limit, started):
     worked = False
     while True:
         now = time.time()
+        if os.path.exists(SCAN_REQUEST):  # pencereden "şimdi tara" istendi
+            try:
+                os.remove(SCAN_REQUEST)
+            except OSError:
+                pass
+            next_scan = 0.0
         if now >= next_scan:
             ctx.gate.reload_if_changed()  # klasör listesi arayüzden değişmiş olabilir
             st = await asyncio.to_thread(scan, cfg)
@@ -2094,21 +2265,28 @@ async def cmd_restore(cfg, args):
         await client.disconnect()
 
 
-async def cmd_verify(cfg):
+async def verify_archive(cfg, progress=None):
+    """Telegram'daki bütün parçaları kontrol eder; eksik/bozuk olanlar tekrar yüklenmek üzere işaretlenir.
+    Dönüş: (kontrol edilen, eksik)."""
     client = await connect(cfg)
+    db = open_db()
     try:
-        ctx = Ctx(client=client, db=open_db(), channel=channel_peer(cfg))
-        total, bad = await verify(ctx)
-        print(f'{fmt_count(total)} parça kontrol edildi, {bad} tanesi eksik/bozuk'
-              + (' (tekrar yüklenecek)' if bad else ''))
+        return await verify(Ctx(client=client, db=db, channel=channel_peer(cfg)), progress=progress)
     finally:
+        db.close()
         await client.disconnect()
 
 
-async def cmd_reindex(cfg):
+async def cmd_verify(cfg):
+    total, bad = await verify_archive(cfg)
+    print(f'{fmt_count(total)} parça kontrol edildi, {bad} tanesi eksik/bozuk' + (' (tekrar yüklenecek)' if bad else ''))
+
+
+async def reindex(cfg):
+    """Yerel kayıtları Telegram'daki arşivden yeniden kurar (bilgisayar değişince ya da veritabanı bozulunca).
+    Zaten yüklü olanlar tekrar yüklenmez. Dönüş: (kanaldaki klip, eksiksiz olan)."""
     client = await connect(cfg)
     try:
-        print('Kanal okunuyor…')
         groups = await collect_channel(client, channel_peer(cfg))
         db = open_db()
         complete = 0
@@ -2127,10 +2305,16 @@ async def cmd_reindex(cfg):
                     complete += 1
                     db.execute("UPDATE blobs SET status='done', done_at=?, sha256=? WHERE fp=?",
                                (time.time(), m['sha'] if m['nparts'] == 1 else None, fp))
-        print(f'Kanalda {fmt_count(len(groups))} klip bulundu, {fmt_count(complete)} tanesi eksiksiz. '
-              'Veritabanı güncellendi.')
+        db.close()
+        return len(groups), complete
     finally:
         await client.disconnect()
+
+
+async def cmd_reindex(cfg):
+    print('Kanal okunuyor…')
+    found, complete = await reindex(cfg)
+    print(f'Kanalda {fmt_count(found)} klip bulundu, {fmt_count(complete)} tanesi eksiksiz. Veritabanı güncellendi.')
 
 
 def main():
@@ -2164,6 +2348,13 @@ def main():
     sub.add_parser('cikis')
     args = ap.parse_args()
 
+    if args.komut == 'calis':
+        if not single_instance():
+            return  # arka planda zaten bir yükleyici var
+        try:
+            migrate_data()  # 1.7 öncesi kurulum: veriler program klasöründen %APPDATA%'ya
+        except Exception as e:
+            print(f'Veriler taşınamadı, eski yerden devam: {e}')
     cfg = load_config()
     if not os.path.exists(CONFIG_PATH):
         save_config(cfg)

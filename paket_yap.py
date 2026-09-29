@@ -16,29 +16,23 @@ import sys
 import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-APP_FILES = ['klip_kalkani.py', 'arayuz.pyw', 'duzenle.py', 'kalkan.ico']
+APP_FILES = ['Klip Kalkanı.exe', 'klip_kalkani.py', 'arayuz.pyw', 'duzenle.py', 'kalkan.ico']
 SKIP_TOP = {'Lib', 'Scripts', 'include', 'libs', 'Doc', 'Tools', 'share', 'NEWS.txt'}
 SKIP_LIB = {'site-packages', 'test', 'idlelib', 'turtledemo', 'ensurepip', 'lib2to3', '__pycache__'}
 NO_CACHE = shutil.ignore_patterns('__pycache__', '*.pyc')
-
-BATS = {
-    'Klip Kalkanı.bat': '@echo off\r\ncd /d "%~dp0"\r\nstart "" "python\\pythonw.exe" -E -s arayuz.pyw\r\n',
-    'Otomatik Başlatmayı Kaldır.bat': ('@echo off\r\nchcp 65001 >nul\r\ncd /d "%~dp0"\r\n'
-                                       '"python\\python.exe" -E -s klip_kalkani.py kaldir\r\necho.\r\npause\r\n'),
-}
 
 README = """KLİP KALKANI — oyun kliplerini Telegram'a otomatik yedekler
 ================================================================
 
 KURULUM (bir kere, 2 dakika)
 1. Bu klasörü kalıcı bir yere koy, örneğin C:\\KlipKalkani ya da D:\\KlipKalkani.
-   (Zip'in içinden çalıştırma; önce klasöre çıkar. Kurulumdan sonra klasörü taşıma.)
-2. "Klip Kalkanı.bat" dosyasına çift tıkla. Kurulum penceresi açılır:
+   (Zip'in içinden çalıştırma; önce klasöre çıkar.)
+2. "Klip Kalkanı.exe"ye çift tıkla. Kurulum penceresi açılır:
    - Klip klasörlerini (Medal, NVIDIA, Outplayed, OBS, Xbox...) kendisi bulur. "Klasör ekle" ile başkası da eklenir.
    - "İnternet hızımı ölç"e bas, gündüz/gece hız sınırını kendisi seçer.
    - Telefon numaranı yaz (+90...), "Kod gönder"e bas, Telegram uygulamana gelen kodu yazıp "Giriş yap"a bas.
      İki adımlı şifren varsa onu da ister.
-   - "Kurulumu bitir"e bas. Bitti!
+   - "Kurulumu bitir"e bas. Bitti! Masaüstüne ve Başlat menüsüne "Klip Kalkanı" kısayolu konur.
 3. Windows "bilinmeyen uygulama" uyarısı verirse: "Ek bilgi" > "Yine de çalıştır".
 
 NE YAPAR
@@ -49,17 +43,28 @@ NE YAPAR
 - Düzenle sekmesi: sesli önizleme, kayıpsız kesme, tam kare kesme (NVIDIA), klip birleştirme.
 - Hiçbir dosyayı silmez, taşımaz. Aynı klip iki kere yüklenmez.
 
+MENÜ (pencerenin üstünde)
+- Program: duraklat/devam, "Windows açılınca otomatik başlat" (aç/kapat), masaüstü ve Başlat menüsü kısayolu,
+  program / ayar klasörü, günlük, "Programı kaldır".
+- Yedek: klasörleri şimdi tara, Telegram'daki yedekleri doğrula, kayıtları Telegram'dan yeniden kur,
+  arşiv grubunu Telegram'da aç.
+- Hesap: hangi Telegram hesabı, çıkış yap.   Yardım: güncellemeleri kontrol et, sürüm notları, hakkında.
+
+AYARLAR NEREDE?
+- Ayarlar, Telegram girişi ve yedek kayıtları %APPDATA%\\KlipKalkani klasöründe durur (Program > Ayar klasörünü aç).
+  Yeni sürümü başka bir klasöre açsan da ayarların gelir, kurulum tekrar sorulmaz.
+- Eski bir sürümü (1.6 ve öncesi) güncelliyorsan: yeni zip'i eski klasörün üstüne açman yeter; ayarlar ilk açılışta
+  kendiliğinden oraya taşınır. Başka klasöre açtıysan kurulum ekranında "Ayarlarımı buraya al"a bas.
+
 GÜNCELLEME
 - Program kendini GitHub'dan otomatik günceller; bir şey yapmana gerek yok. Sürüm pencerenin başlığında yazar.
-- Hemen bakmak istersen: Ayarlar sekmesi > "Güncellemeleri kontrol et".
+- Hemen bakmak istersen: Yardım > "Güncellemeleri kontrol et" (ya da Ayarlar sekmesindeki düğme).
 
 DİĞER
-- Masaüstündeki "Klip Kalkanı" kısayolu: durum, Duraklat/Devam, hız, oyunlar, klasörler, geri yükleme, düzenleme.
 - Ayarlar sekmesi: hangi Telegram hesabına yedeklendiğini gösterir. "Çıkış yap" bu bilgisayardaki girişi kapatır;
   yedekler Telegram'da kalır, aynı hesapla tekrar girince kaldığı yerden sürer.
-- "Otomatik Başlatmayı Kaldır.bat": arka planda çalışmayı kapatır (dosyalara ve yedeklere dokunmaz).
 - Telegram, hesap başına indirmeyi ~6 MB/sn ile sınırlar; toplu geri yükleme biraz sürer.
-- klip_kalkani.session dosyası Telegram hesabına erişim demektir, KİMSEYLE PAYLAŞMA.
+- Ayar klasöründeki klip_kalkani.session dosyası Telegram hesabına erişim demektir, KİMSEYLE PAYLAŞMA.
 """
 
 
@@ -108,9 +113,6 @@ def main():
     shutil.rmtree(os.path.join(site, 'bin'), ignore_errors=True)  # pip'in yazdığı, yolu gömülü exe'ler
     for f in APP_FILES:
         shutil.copy2(os.path.join(HERE, f), work)
-    for name, text in BATS.items():
-        with open(os.path.join(work, name), 'w', encoding='utf-8', newline='') as f:
-            f.write(text)
     with open(os.path.join(work, 'BENİ OKU.txt'), 'w', encoding='utf-8-sig', newline='\r\n') as f:
         f.write(README)
     suffix = ''

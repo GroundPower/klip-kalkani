@@ -13,12 +13,14 @@ Oyun kliplerini (Medal, NVIDIA, Outplayed, OBS, Xbox Game Bar…) **Telegram'da 
 - **Düzenle:** Sesli önizleme (60 FPS / tam FPS), zaman çubuğu, A–B seçimi, **kayıpsız kesme** (saniyeler sürer), **tam kare kesme** (NVIDIA NVENC) ve **kayıpsız birleştirme**.
 - **Kendini günceller:** Yeni sürümler bu repodan otomatik iner. Dosyalar özetleriyle doğrulanır, eski sürüm `eski_surum/` klasöründe yedeklenir. Ayarlar sekmesindeki "Güncellemeleri kontrol et" ile elle de bakılır.
 - **Hesap ve çıkış:** Ayarlar sekmesi yedeklerin hangi Telegram hesabına gittiğini gösterir. "Çıkış yap" bu bilgisayardaki girişi kapatır (Telegram'ın cihaz listesinden de düşer); yedekler Telegram'da kalır. Aynı hesapla tekrar girince kaldığı yerden sürer. Başka bir hesapla girilirse o hesapta yeni bir arşiv grubu açılır.
+- **Sade menü:** Pencerenin üstünde Program / Yedek / Hesap / Yardım menüsü. Otomatik başlatmayı aç/kapat, masaüstü ve Başlat menüsü kısayolu, şimdi tara, yedekleri doğrula, kayıtları Telegram'dan yeniden kur, programı kaldır.
+- **Ayarlar kaybolmaz:** Ayarlar, Telegram girişi ve yedek kayıtları `%APPDATA%\KlipKalkani`'de durur. Yeni sürüm başka klasöre açılsa da ayarlar gelir. 1.6 ve önceki sürümlerin program klasöründeki ayarları ilk açılışta oraya taşınır.
 - **Hiçbir şey silmez:** Ne bilgisayardaki dosyalara ne de Telegram'daki yedeklere dokunur.
 
 ## Kurulum
 
 1. [Releases](../../releases) sayfasından `KlipKalkani-<sürüm>.zip`'i indir. Kalıcı bir klasöre çıkar (ör. `C:\KlipKalkani`).
-2. `Klip Kalkanı.bat`'a çift tıkla. Kurulum penceresi seni adım adım götürür:
+2. `Klip Kalkanı.exe`'ye çift tıkla. Kurulum penceresi seni adım adım götürür:
    - Klip klasörleri
    - Hız ayarı
    - Telegram API bilgisi (bir kere): [my.telegram.org](https://my.telegram.org/apps) → *API development tools*
@@ -29,7 +31,7 @@ Python kurmana gerek yok. Paket kendi taşınabilir Python'uyla gelir.
 ## Gizlilik
 
 - Klipler sadece senin Telegram hesabındaki gizli gruba gider. Başka bir sunucu yok.
-- Telegram oturumu (`klip_kalkani.session`), ayarlar ve veritabanı sadece senin bilgisayarında durur. Repoya hiçbir zaman girmez (`.gitignore` yalnızca program dosyalarına izin verir).
+- Telegram oturumu (`klip_kalkani.session`), ayarlar ve veritabanı sadece senin bilgisayarında (`%APPDATA%\KlipKalkani`) durur. Repoya hiçbir zaman girmez (`.gitignore` yalnızca program dosyalarına izin verir).
 - İnternet hızı ölçümü için Cloudflare'in hız testi adresine rastgele veri gönderilir. Kişisel veri gitmez.
 
 ## Geliştirici notları
@@ -39,6 +41,8 @@ Python kurmana gerek yok. Paket kendi taşınabilir Python'uyla gelir.
 | `klip_kalkani.py` | Yedekleme motoru ve komut satırı: `calis`, `tara`, `durum`, `geri-yukle`, `dogrula`, `indeks-yenile`, `cikis`, `kaldir` |
 | `arayuz.pyw` | Pencere: kurulum, durum, hız, oyunlar, klasörler, geri yükleme, ayarlar (hesap, çıkış, güncelleme) |
 | `duzenle.py` | Önizleme, kesme ve birleştirme (PyAV) |
+| `baslatici.cs` | `Klip Kalkanı.exe`: yanındaki taşınabilir Python'la (ya da `.venv` ile) pencereyi açan küçük başlatıcı |
+| `exe_yap.py` | `baslatici.cs`'i Windows'la gelen `csc.exe` ile derler (sadece başlatıcı değişince) |
 | `paket_yap.py` | Taşınabilir zip'i yapar: `python paket_yap.py [--api varsayilan.json]` |
 | `yayinla.py` | Yeni sürüm için `surum.json`'u üretir |
 
