@@ -10,6 +10,8 @@ Komutlar (.venv\\Scripts\\python.exe klip_kalkani.py <komut>):
   geri-yukle [HEDEF]    Klipleri kanaldan indirip HEDEF klasöre koy (--oyun, --ay, --ara, --hepsi, --liste)
   indeks-yenile         Yerel veritabanını kanaldan yeniden kur (bilgisayar değişirse)
   yukle-dene DOSYA      Tek bir dosyayı hemen yükle (deneme için)
+  cikis                 Telegram'dan çıkış yap (yedekleme durur; Telegram'daki yedekler kalır)
+  kaldir                Otomatik başlatmayı kaldır
 
 Hiçbir komut bilgisayardaki klipleri silmez, taşımaz veya değiştirmez. Kanala sadece ekleme yapılır.
 """
@@ -39,12 +41,13 @@ import time
 
 import psutil
 
-VERSION = '1.5'
+VERSION = '1.6'
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, 'ayarlar.json')
 DB_PATH = os.path.join(BASE, 'klip_kalkani.db')
 SESSION_BASE = os.path.join(BASE, 'klip_kalkani')  # Telethon sonuna .session ekler
 SESSION_FILE = SESSION_BASE + '.session'
+LOGIN_SESSION_BASE = SESSION_BASE + '-giris'  # pencereden giriş sürerken; bitince SESSION_FILE olur
 STATUS_PATH = os.path.join(BASE, 'durum.json')
 LOG_DIR = os.path.join(BASE, 'log')
 
@@ -630,8 +633,14 @@ def build_queue(db, cfg, since):
 
 # ---------------------------------------------------------------- Telegram
 
-def make_client(cfg, forever=False):
+def new_client(session, cfg, **kw):
     from telethon import TelegramClient
+    return TelegramClient(session, int(cfg['api_id']), cfg['api_hash'], device_model='Klip Kalkani',
+                          system_version='Windows', app_version=VERSION, lang_code='tr', system_lang_code='tr',
+                          receive_updates=False, **kw)
+
+
+def make_client(cfg, forever=False):
     from telethon.sessions import SQLiteSession, StringSession
     if not cfg.get('api_id') or not cfg.get('api_hash'):
         raise NotLoggedIn('api_id/api_hash yok')
@@ -645,12 +654,8 @@ def make_client(cfg, forever=False):
         s.close()
     if not string:
         raise NotLoggedIn('oturum boş')
-    return TelegramClient(
-        StringSession(string), int(cfg['api_id']), cfg['api_hash'],
-        device_model='Klip Kalkani', system_version='Windows', app_version=VERSION,
-        lang_code='tr', system_lang_code='tr', receive_updates=False,
-        connection_retries=-1 if forever else 5, retry_delay=5, request_retries=5,
-        flood_sleep_threshold=300)
+    return new_client(StringSession(string), cfg, connection_retries=-1 if forever else 5, retry_delay=5,
+                      request_retries=5, flood_sleep_threshold=300)
 
 
 def channel_peer(cfg):
@@ -711,7 +716,7 @@ class Status:
     """Arka plandaki işin ne yaptığını durum.json'a yazar (durum komutu okur)."""
 
     def __init__(self):
-        self.data = {'pid': os.getpid(), 'basladi': time.time()}
+        self.data = {'pid': os.getpid(), 'basladi': time.time(), 'surum': VERSION}
         self.last_write = 0.0
         self.window = collections.deque()
 
@@ -1353,6 +1358,12 @@ def start_task():
     subprocess.run(['schtasks', '/Run', '/TN', TASK_NAME], capture_output=True, creationflags=0x08000000)
 
 
+def restart_task():
+    """Arka plandaki yükleyiciyi kapatıp yeniden başlatır (diskteki yeni kodla açılsın diye)."""
+    subprocess.run(['schtasks', '/End', '/TN', TASK_NAME], capture_output=True, creationflags=0x08000000)
+    subprocess.run(['schtasks', '/Run', '/TN', TASK_NAME], capture_output=True, creationflags=0x08000000)
+
+
 # ---------------------------------------------------------------- otomatik güncelleme (GitHub)
 
 GUNCELLEME_REPO = 'GroundPower/klip-kalkani'  # herkese açık repo; boş bırakılırsa güncelleme kapalı
@@ -1370,13 +1381,28 @@ def _http_get(url, timeout=30):
         return r.read()
 
 
+def is_dev_copy():
+    """git ile çalışılan geliştirme kopyası mı? (Kendini güncellemez, değişiklikler git ile gelir.)"""
+    return os.path.isdir(os.path.join(BASE, '.git'))
+
+
+def is_newer(v):
+    return _version_tuple(v) > _version_tuple(VERSION)
+
+
+def fetch_manifest():
+    """GitHub'daki son sürümün bilgisi (surum.json). Sondaki ?t= önbellekteki eski kopyayı atlatır."""
+    url = f'https://raw.githubusercontent.com/{GUNCELLEME_REPO}/main/surum.json?t={int(time.time())}'
+    return json.loads(_http_get(url))
+
+
 def check_update():
     """GitHub'da daha yeni sürüm varsa bilgisini (surum.json) döndürür, yoksa None.
     Geliştirme kopyasında (.git klasörü olan yerde) bakmaz."""
-    if not GUNCELLEME_REPO or os.path.isdir(os.path.join(BASE, '.git')):
+    if not GUNCELLEME_REPO or is_dev_copy():
         return None
-    m = json.loads(_http_get(f'https://raw.githubusercontent.com/{GUNCELLEME_REPO}/main/surum.json'))
-    return m if _version_tuple(m['surum']) > _version_tuple(VERSION) else None
+    m = fetch_manifest()
+    return m if is_newer(m['surum']) else None
 
 
 def apply_update(m):
@@ -1439,18 +1465,37 @@ def uploader_alive():
         return False
 
 
+def stop_uploader(wait=20):
+    """Arka plandaki yükleyiciyi kapatır. Görev açık kalırsa yarım saatlik kontrolde yine başlar;
+    tamamen durması için disable_task() da gerekir."""
+    subprocess.run(['schtasks', '/End', '/TN', TASK_NAME], capture_output=True, creationflags=0x08000000)
+    pid = (read_json(STATUS_PATH, {}) or {}).get('pid')
+    if not pid:
+        return
+    try:
+        p = psutil.Process(pid)
+        if 'python' in p.name().lower() and any('klip_kalkani' in a.lower() for a in p.cmdline()):
+            p.terminate()
+            p.wait(wait)
+    except psutil.Error:
+        pass
+
+
+def disable_task():
+    subprocess.run(['schtasks', '/Change', '/TN', TASK_NAME, '/DISABLE'], capture_output=True,
+                   creationflags=0x08000000)
+
+
 # ---------------------------------------------------------------- komutlar
 
 async def cmd_login(cfg):
-    from telethon import TelegramClient, errors, functions, types
+    from telethon import errors
     print('Klip Kalkanı: Telegram girişi\n')
     if not cfg.get('api_id') or not cfg.get('api_hash'):
         cfg['api_id'] = int(input('api_id: ').strip())
         cfg['api_hash'] = input('api_hash: ').strip()
         save_config(cfg)
-    client = TelegramClient(SESSION_BASE, int(cfg['api_id']), cfg['api_hash'], device_model='Klip Kalkani',
-                            system_version='Windows', app_version=VERSION, lang_code='tr', system_lang_code='tr',
-                            receive_updates=False)
+    client = new_client(SESSION_BASE, cfg)
     await client.connect()
     try:
         if not await client.is_user_authorized():
@@ -1481,22 +1526,53 @@ async def cmd_login(cfg):
         me = await client.get_me()
         print(f'\nGiriş tamam: {me.first_name} (Premium: {"evet" if me.premium else "hayır"})')
         await ensure_archive(client, cfg)
+        remember_account(account_info(me))
         print('\nHer şey hazır. Bu pencereyi kapatabilirsin.')
     finally:
         await client.disconnect()
 
 
-async def ensure_archive(client, cfg):
-    """Arşiv grubunu hazırlar: sadece senin olduğun, her oyuna ayrı konu açılan gizli forum grubu."""
+async def find_archive(client, cfg):
+    """Kayıtlı arşiv grubunu bu hesapla bulur; bulamazsa None. Grubun erişim anahtarı hesaba göre değişir:
+    grup bu hesabın sohbetlerinde başka anahtarla duruyorsa yenisi ayarlara yazılır."""
+    from telethon import errors, functions, types
+    cid, chash = int(cfg['kanal_id']), int(cfg.get('kanal_hash') or 0)
+    try:
+        r = await client(functions.channels.GetChannelsRequest([types.InputChannel(cid, chash)]))
+        ch = next((c for c in r.chats if c.id == cid), None)
+        if isinstance(ch, types.Channel) and not ch.left:
+            if ch.access_hash and not ch.min and ch.access_hash != chash:
+                cfg['kanal_hash'] = ch.access_hash
+                save_config(cfg)
+            return ch
+    except errors.BadRequestError:  # CHANNEL_INVALID / CHANNEL_PRIVATE: bu hesapla bu anahtar geçmiyor
+        pass
+    async for d in client.iter_dialogs():
+        e = d.entity
+        if isinstance(e, types.Channel) and e.id == cid and not e.left:
+            if e.access_hash != chash:
+                cfg['kanal_hash'] = e.access_hash
+                save_config(cfg)
+            return e
+    return None
+
+
+async def ensure_archive(client, cfg, allow_new=True):
+    """Arşiv grubunu hazırlar: sadece senin olduğun, her oyuna ayrı konu açılan gizli forum grubu.
+    Dönüş: 'hazir' (kayıtlı grup bu hesapla açılıyor), 'yeni' (yeni grup açıldı) ya da 'erisim_yok' (kayıtlı gruba
+    bu hesapla ulaşılamıyor ve allow_new=False; örneğin başka bir hesapla giriş yapılmış)."""
     from telethon import functions, types
-    if cfg.get('kanal_id') and cfg.get('kanal_hash') and cfg.get('kanal_turu') == 'forum':
-        try:
-            ent = await client.get_entity(types.InputPeerChannel(int(cfg['kanal_id']), int(cfg['kanal_hash'])))
-            print(f'Arşiv grubu hazır: {ent.title}')
-            return
-        except Exception as e:
-            print(f'Kayıtlı arşiv grubuna ulaşılamadı ({e}), yenisi açılacak.')
-    if cfg.get('kanal_id') and cfg.get('kanal_hash') and cfg.get('kanal_turu') != 'forum':
+    if cfg.get('kanal_id') and cfg.get('kanal_turu') == 'forum':
+        ch = await find_archive(client, cfg)
+        if ch is not None:
+            print(f'Arşiv grubu hazır: {ch.title}')
+            return 'hazir'
+        if not allow_new:
+            return 'erisim_yok'
+        print('Kayıtlı arşiv grubuna bu hesapla ulaşılamadı, yenisi açılacak.')
+        cfg.setdefault('eski_kanallar', []).append({'id': cfg['kanal_id'], 'hash': cfg.get('kanal_hash'),
+                                                   'hesap': (cfg.get('hesap') or {}).get('id')})
+    elif cfg.get('kanal_id') and cfg.get('kanal_hash'):
         # Eski (konusuz) kanal: silmiyoruz, sadece adını değiştiriyoruz ki karışmasın.
         try:
             await client(functions.channels.EditTitleRequest(
@@ -1504,6 +1580,7 @@ async def ensure_archive(client, cfg):
         except Exception as e:
             log.warning('Eski kanalın adı değiştirilemedi: %s', e)
         cfg.setdefault('eski_kanallar', []).append({'id': cfg['kanal_id'], 'hash': cfg['kanal_hash']})
+    old = cfg.get('kanal_id')
     r = await client(functions.channels.CreateChannelRequest(
         title=cfg['kanal_adi'], about=ABOUT, megagroup=True, forum=True))
     ch = next(c for c in r.chats if isinstance(c, types.Channel))
@@ -1513,6 +1590,10 @@ async def ensure_archive(client, cfg):
     cfg['kanal_hash'] = ch.access_hash
     cfg['kanal_turu'] = 'forum'
     save_config(cfg)
+    if old:
+        bak = reset_upload_state(old)
+        if bak:
+            print(f'Klipler yeni gruba baştan yüklenecek. Eski kayıtlar: {os.path.basename(bak)}')
     peer = types.InputPeerChannel(ch.id, ch.access_hash)
     msg = await client.send_file(peer, os.path.abspath(__file__), caption=README, parse_mode='html',
                                  force_document=True)
@@ -1520,6 +1601,95 @@ async def ensure_archive(client, cfg):
     cfg['readme_msg_id'] = msg.id
     save_config(cfg)
     print(f'Gizli arşiv grubu açıldı: {cfg["kanal_adi"]} (her oyun kendi konusunda)')
+    return 'yeni'
+
+
+def reset_upload_state(old_channel):
+    """Arşiv grubu değişti (başka hesap ya da grup silinmiş): klipler yeni gruba baştan yüklenecek.
+    Önce veritabanının kopyası alınır; tarama bilgisi (dosyalar ve parmak izleri) aynen kalır."""
+    if not os.path.exists(DB_PATH):
+        return None
+    db = open_db()
+    try:
+        if not db.execute('SELECT 1 FROM parts UNION ALL SELECT 1 FROM topics LIMIT 1').fetchone():
+            return None
+        bak = os.path.join(BASE, f'klip_kalkani.{old_channel}.{time.strftime("%Y%m%d-%H%M%S")}.db')
+        dst = sqlite3.connect(bak)
+        try:
+            db.backup(dst)
+        finally:
+            dst.close()
+        with db:
+            db.execute('DELETE FROM parts')
+            db.execute('DELETE FROM topics')
+            db.execute("UPDATE blobs SET status='pending', nparts=NULL, chunk_len=NULL, sha256=NULL, done_at=NULL, "
+                       'attempts=0, next_try=0, last_error=NULL')
+            db.execute("DELETE FROM meta WHERE k IN ('ilk_yedek_bitti', 'son_basari', 'son_dogrulama')")
+        return bak
+    finally:
+        db.close()
+
+
+def account_info(me):
+    phone = me.phone or ''
+    return {'id': me.id, 'ad': ' '.join(filter(None, [me.first_name, me.last_name])) or me.username or str(me.id),
+            'kullanici': me.username, 'tel_son': phone[-4:] or None, 'premium': bool(getattr(me, 'premium', False))}
+
+
+def remember_account(info):
+    """Arşiv grubunun sahibi olan hesabı ayarlara yazar (pencerede gösterilir)."""
+    cfg = load_config()
+    cfg['hesap'] = info
+    save_config(cfg)
+    return info
+
+
+def install_login_session():
+    """Pencereden yapılan giriş tamamlandı: geçici oturum dosyası asıl yerine geçer."""
+    src = LOGIN_SESSION_BASE + '.session'
+    if os.path.exists(src):
+        os.replace(src, SESSION_FILE)
+
+
+async def telegram_logout(prepare=None):
+    """Bu bilgisayardaki Telegram girişini kapatır: oturum Telegram'daki cihaz listesinden de düşer ve oturum
+    dosyası silinir. Arşiv grubuna ve kliplere dokunmaz. prepare: Telegram'a bağlanıldıktan sonra, çıkıştan hemen
+    önce çalışır (yükleyiciyi durdurmak için); internet yoksa hiçbir şey değişmeden hata verir."""
+    cfg = load_config()
+    for base in (SESSION_BASE, LOGIN_SESSION_BASE):
+        path = base + '.session'
+        if not os.path.exists(path):
+            continue
+        client = new_client(base, cfg)
+        try:
+            await client.connect()
+            if prepare:
+                await asyncio.to_thread(prepare)
+                prepare = None
+            if await client.is_user_authorized():
+                await client.log_out()  # başarılıysa oturum dosyasını da siler
+        finally:
+            if client.session is not None:
+                await client.disconnect()
+        if os.path.exists(path):  # oturum zaten kapanmışsa (ya da çıkış reddedildiyse) işe yaramaz, kenara al
+            os.replace(path, path + '.eski')
+    if prepare:
+        await asyncio.to_thread(prepare)
+
+
+def stop_backup():
+    """Yükleyiciyi ve otomatik başlatmayı kapatır (çıkış yaparken)."""
+    stop_uploader()
+    disable_task()
+
+
+async def cmd_logout():
+    if not os.path.exists(SESSION_FILE):
+        print('Bu bilgisayarda Telegram girişi yok.')
+        return
+    await telegram_logout(prepare=stop_backup)
+    print("Telegram'dan çıkış yapıldı; yedekleme durdu. Telegram'daki arşiv grubu ve klipler olduğu gibi duruyor.")
+    print('Tekrar başlatmak için Klip Kalkanı penceresini açıp giriş yap.')
 
 
 def cmd_uninstall():
@@ -1991,6 +2161,7 @@ def main():
     p = sub.add_parser('yukle-dene')
     p.add_argument('dosya')
     sub.add_parser('kaldir')
+    sub.add_parser('cikis')
     args = ap.parse_args()
 
     cfg = load_config()
@@ -2016,6 +2187,8 @@ def main():
             asyncio.run(cmd_try(cfg, args.dosya))
         elif args.komut == 'kaldir':
             cmd_uninstall()
+        elif args.komut == 'cikis':
+            asyncio.run(cmd_logout())
     except NotLoggedIn as e:
         print(f'Önce giriş yapman lazım ({e}): Klip Kalkanı penceresini aç.')
         sys.exit(2)

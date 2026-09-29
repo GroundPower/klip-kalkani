@@ -1,12 +1,12 @@
 {
-  "surum": "1.5",
-  "etiket": "v1.5",
+  "surum": "1.6",
+  "etiket": "v1.6",
   "tarih": "2026-09-29",
-  "notlar": "İlk sürüm: otomatik yedek, oyun konuları, önizleme, düzenleyici, otomatik güncelleme",
+  "notlar": "Ayarlar sekmesi: Telegram hesabı ve çıkış, güncellemeleri elle kontrol. Başka hesapla girilirse o hesapta yeni arşiv grubu. Program dosyaları yenilenince arka plan yeni sürümle yeniden başlar.",
   "dosyalar": {
-    "klip_kalkani.py": "8a120761f12ec30e81a8069b44e540705365cb8c3f3ed581d88d6c46dd13f2df",
-    "arayuz.pyw": "1475e92266d2b2ae4bcd0f28b1cd7fc6ae1e8977b5e2b26493d3600bd891d541",
-    "duzenle.py": "27ccf9cf16fe976061d9bfd16b36cdfbb758a35fb64ad27f25476377b2070ffe",
+    "klip_kalkani.py": "ee19792df86d373aa4b4b306e5c0df98f0240395e687fc4b6688aa0d7c19ddc7",
+    "arayuz.pyw": "210f151390233be1ef6765ded658bb06b0419d8203f2756591d50d5f0b506733",
+    "duzenle.py": "85fff8e09eeea7b0d086c982ed8780e93cf56f3949324812e68b7b018e2a3987",
     "kalkan.ico": "e6190e96224a6adf554c9811b09a956be68943c4d48433d8e4435aeaee971504"
   },
   "gereken_moduller": [

@@ -2,8 +2,9 @@
 """Klip Kalkanı penceresi.
 
 İlk açılışta kurulum (klip klasörleri, hız, Telegram girişi), sonra durum ekranı: ne yükleniyor,
-duraklat/devam, hız ayarı, oyunlar, klasörler, geri yükleme ve klip düzenleme. Pencereyi kapatmak
-yedeklemeyi durdurmaz; yedekleme arka planda (Görev Zamanlayıcı'daki "Klip Kalkani" görevi) çalışır.
+duraklat/devam, hız ayarı, oyunlar, klasörler, geri yükleme, klip düzenleme ve ayarlar (Telegram hesabı,
+çıkış, güncelleme). Pencereyi kapatmak yedeklemeyi durdurmaz; yedekleme arka planda (Görev Zamanlayıcı'daki
+"Klip Kalkani" görevi) çalışır.
 """
 
 import asyncio
@@ -13,11 +14,13 @@ import ctypes
 import datetime as dt
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
+import urllib.error
 import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
@@ -106,6 +109,22 @@ def date_text(ts):
 
 def human_ago(ts):
     return kk.fmt_duration(time.time() - ts) + ' önce' if ts else '—'
+
+
+def account_text(h):
+    """'Kaan (@kaan)' gibi."""
+    s = h.get('ad') or '?'
+    if h.get('kullanici'):
+        s += f' (@{h["kullanici"]})'
+    return s
+
+
+def update_error_text(e):
+    if isinstance(e, urllib.error.HTTPError):
+        return f'GitHub {e.code} hatası verdi'
+    if isinstance(e, OSError):  # URLError de buna dahil
+        return 'GitHub\'a ulaşılamadı (internet bağlantısı?)'
+    return str(e)
 
 
 def ensure_icon():
@@ -210,19 +229,20 @@ class Async:
 
 
 class TelegramLogin:
+    """Pencereden Telegram girişi. Giriş ayrı bir oturum dosyasında yapılır, her şey bitince asıl yerine konur;
+    yarım kalan bir giriş programı girişli sanmasın diye."""
+
     def __init__(self):
         self.client = None
         self.phone = None
         self.code_hash = None
 
     async def _client(self):
-        from telethon import TelegramClient
         if self.client is None:
-            cfg = kk.load_config()
-            self.client = TelegramClient(
-                kk.SESSION_BASE, int(cfg['api_id']), cfg['api_hash'], device_model='Klip Kalkani',
-                system_version='Windows', app_version=kk.VERSION, lang_code='tr', system_lang_code='tr',
-                receive_updates=False)
+            tmp = kk.LOGIN_SESSION_BASE + '.session'
+            if os.path.exists(kk.SESSION_FILE) and not os.path.exists(tmp):
+                shutil.copy2(kk.SESSION_FILE, tmp)  # bu bilgisayarda giriş zaten varsa onunla devam edilir
+            self.client = kk.new_client(kk.LOGIN_SESSION_BASE, kk.load_config())
         if not self.client.is_connected():
             await self.client.connect()
         return self.client
@@ -253,14 +273,35 @@ class TelegramLogin:
         await c.sign_in(password=pw)
         return 'tamam'
 
-    async def finish(self):
-        """Arşiv grubunu hazırlar (yoksa açar), bağlantıyı kapatır. Adı döndürür."""
+    async def finish(self, allow_new=True):
+        """Arşiv grubunu hazırlar (allow_new ise gerekirse yenisini açar) ve girişi kaydeder.
+        Dönüş: (durum, hesap). durum 'hazir', 'yeni' ya da 'erisim_yok' (o zaman bağlantı açık kalır)."""
         c = await self._client()
         me = await c.get_me()
-        cfg = kk.load_config()
-        await kk.ensure_archive(c, cfg)
-        await c.disconnect()
-        return f'{me.first_name or ""} {me.last_name or ""}'.strip(), bool(getattr(me, 'premium', False))
+        info = kk.account_info(me)
+        state = await kk.ensure_archive(c, kk.load_config(), allow_new=allow_new)
+        if state != 'erisim_yok':
+            kk.remember_account(info)
+            await c.disconnect()
+            self.client = None
+            kk.install_login_session()
+        return state, info
+
+    async def cancel(self):
+        """Yanlış hesapla girildiyse bu girişi kapatır (Telegram'daki cihaz listesinden de düşer)."""
+        c, self.client = self.client, None
+        if c is not None:
+            try:
+                if not c.is_connected():
+                    await c.connect()
+                if await c.is_user_authorized():
+                    await c.log_out()
+            finally:
+                if c.session is not None:
+                    await c.disconnect()
+        tmp = kk.LOGIN_SESSION_BASE + '.session'
+        if os.path.exists(tmp):
+            os.replace(tmp, tmp + '.eski')
 
 
 def friendly_error(e):
@@ -273,6 +314,8 @@ def friendly_error(e):
         'FloodWaitError': f'Telegram çok fazla deneme dedi, {getattr(e, "seconds", "?")} sn sonra tekrar dene.',
         'ApiIdInvalidError': 'API bilgileri (api_id/api_hash) geçersiz.',
         'NotLoggedIn': 'Telegram girişi yok. Durum sekmesinden girişi yenile.',
+        'ConnectionError': 'Telegram\'a bağlanılamadı; internet bağlantını kontrol et.',
+        'TimeoutError': 'Telegram cevap vermedi; internet bağlantını kontrol edip tekrar dene.',
     }
     return msgs.get(name, f'{name}: {e}')
 
@@ -327,29 +370,69 @@ class App(tk.Tk):
         self.after(100, self._poll_ui)
         self.view = None
         self.banner = None
-        if self.needs_setup():
-            self.show(SetupView)
-        else:
-            self.show(DashboardView)
-        self.bg(self._update_check, self._update_done)
+        self.update_info = None   # son güncelleme kontrolü: (zaman, başarılı mı, sonuç)
+        self.update_busy = False
+        self.updated_to = None    # bu pencere açıkken kurulan sürüm (pencere yeniden açılınca devreye girer)
+        self.show(self.first_view())
+        self.check_updates()
 
-    # otomatik güncelleme (GitHub)
-    @staticmethod
-    def _update_check():
-        m = kk.check_update()
-        if not m:
-            return None
+    # güncelleme (GitHub): açılışta kendiliğinden, Ayarlar'daki düğmeyle elle
+    def check_updates(self, manual=False):
+        if self.update_busy:
+            return
+        self.update_busy = True
+        self.bg(self._update_job, self._update_done, manual)
+        self._notify_update()
+
+    def _update_job(self, manual):
+        if not manual:
+            self._refresh_uploader()
+        if not kk.GUNCELLEME_REPO:
+            return {'durum': 'kapali'}
+        if kk.is_dev_copy() and not manual:
+            return None  # geliştirme kopyası açılışta hiç bakmaz
+        m = kk.fetch_manifest()
+        remote = m['surum']
+        if kk.is_dev_copy():
+            return {'durum': 'gelistirici', 'uzak': remote}
+        if self.updated_to and kk._version_tuple(remote) <= kk._version_tuple(self.updated_to):
+            return {'durum': 'kuruldu', 'surum': self.updated_to}
+        if not kk.is_newer(remote):
+            return {'durum': 'guncel', 'uzak': remote}
         new = kk.apply_update(m)
         if kk.task_state() == 'acik' and kk.uploader_alive():
-            # arka plandaki yükleyici de yeni kodla başlasın
-            subprocess.run(['schtasks', '/End', '/TN', kk.TASK_NAME], capture_output=True, creationflags=NO_WINDOW)
-            subprocess.run(['schtasks', '/Run', '/TN', kk.TASK_NAME], capture_output=True, creationflags=NO_WINDOW)
-        return new
+            kk.restart_task()  # arka plandaki yükleyici de yeni kodla başlasın
+        return {'durum': 'kuruldu', 'surum': new}
+
+    @staticmethod
+    def _refresh_uploader():
+        """Program dosyaları yenilenmişse (zip üstüne açılmış ya da güncellenmiş) ama arka plandaki yükleyici hâlâ
+        eski kodla çalışıyorsa yeni sürümle yeniden başlatır. Otomatik başlatma kapalıysa (duraklatılmışsa) dokunmaz."""
+        try:
+            s = kk.read_json(kk.STATUS_PATH, {}) or {}
+            if kk.uploader_alive() and s.get('surum') != kk.VERSION and kk.task_state() == 'acik':
+                kk.restart_task()
+        except Exception as e:
+            print('yükleyici yenilenemedi:', e)
 
     def _update_done(self, res):
-        ok, new = res
-        if not ok or not new:
-            return
+        self.update_busy = False
+        ok, val = res
+        if not (ok and val is None):
+            self.update_info = (time.time(), ok, val)
+        if ok and val and val['durum'] == 'kuruldu':
+            self.updated_to = val['surum']
+            self._show_banner(val['surum'])
+        self._notify_update()
+
+    def _notify_update(self):
+        fn = getattr(self.view, 'show_update_info', None)
+        if fn:
+            fn()
+
+    def _show_banner(self, new):
+        if self.banner is not None:
+            self.banner.destroy()
         self.banner = ttk.Frame(self, padding=(20, 8))
         self.banner.pack(fill='x', before=self.view)
         ttk.Label(self.banner, text=f'✔ Klip Kalkanı {new} sürümüne güncellendi.', foreground=GREEN).pack(side='left')
@@ -385,9 +468,12 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     @staticmethod
-    def needs_setup():
+    def first_view():
         c = kk.load_config()
-        return not (os.path.exists(kk.SESSION_FILE) and c.get('kanal_id') and c.get('kaynaklar'))
+        if not (c.get('kanal_id') and c.get('kaynaklar')):
+            return SetupView
+        # kurulu ama Telegram girişi yok (çıkış yapılmış): sadece giriş ekranı, ayarlar olduğu gibi kalır
+        return DashboardView if os.path.exists(kk.SESSION_FILE) else LoginView
 
     def show(self, view_cls):
         if self.view is not None:
@@ -399,13 +485,242 @@ class App(tk.Tk):
             self.banner.pack(fill='x', before=self.view)
 
 
+# ---------------------------------------------------------------- Telegram girişi
+
+class LoginBox(ttk.LabelFrame):
+    """Telefon → Telegram'a gelen kod → (varsa) iki adımlı şifre."""
+
+    def __init__(self, parent, app, title, on_login, before_send=None):
+        super().__init__(parent, text=title, padding=12)
+        self.app = app
+        self.on_login = on_login
+        self.before_send = before_send
+        self.login = TelegramLogin()
+        self.logged_in = False
+        r = ttk.Frame(self)
+        r.pack(fill='x')
+        ttk.Label(r, text='Telefon:').pack(side='left')
+        self.phone = ttk.Entry(r, width=20)
+        self.phone.insert(0, '+90')
+        self.phone.pack(side='left', padx=6)
+        self.send_btn = ttk.Button(r, text='Kod gönder', command=self.send_code)
+        self.send_btn.pack(side='left')
+        ttk.Label(r, text='   Kod:').pack(side='left')
+        self.code = ttk.Entry(r, width=10, state='disabled')
+        self.code.pack(side='left', padx=6)
+        self.code_btn = ttk.Button(r, text='Giriş yap', command=self.sign_in, state='disabled')
+        self.code_btn.pack(side='left')
+        r2 = ttk.Frame(self)
+        r2.pack(fill='x', pady=(8, 0))
+        ttk.Label(r2, text='İki adımlı şifre (varsa):').pack(side='left')
+        self.pw = ttk.Entry(r2, width=22, show='•', state='disabled')
+        self.pw.pack(side='left', padx=6)
+        self.pw_btn = ttk.Button(r2, text='Onayla', command=self.send_password, state='disabled')
+        self.pw_btn.pack(side='left')
+        self.msg = ttk.Label(self, text='Kod, telefonundaki Telegram uygulamasına gelir.', style='Muted.TLabel')
+        self.msg.pack(anchor='w', pady=(8, 0))
+        self.phone.bind('<Return>', lambda _e: self.send_code())
+        self.code.bind('<Return>', lambda _e: self.sign_in())
+        self.pw.bind('<Return>', lambda _e: self.send_password())
+
+    def say(self, text, color=GREY):
+        self.msg.configure(text=text, foreground=color)
+
+    def check_existing(self):
+        """Bu bilgisayarda giriş zaten varsa (ya da yarım kalan giriş tamamlanmışsa) doğrudan devam eder."""
+        self.app.async_.run(self.login.is_authorized(), self._auth_checked)
+
+    def _auth_checked(self, fut):
+        if not self.winfo_exists():  # bu arada ekran değişmiş
+            return
+        try:
+            if fut.result():
+                self._logged_in('Bu bilgisayarda zaten giriş yapılmış.')
+        except Exception as e:
+            self.say(f'Telegram\'a bağlanılamadı: {friendly_error(e)}')
+
+    def send_code(self):
+        if self.send_btn.instate(['disabled']):
+            return
+        phone = self.phone.get().strip().replace(' ', '')
+        if len(phone) < 8:
+            self.say('Telefon numaranı başında + ile yaz (örn. +905xxxxxxxxx).')
+            return
+        if self.before_send and not self.before_send():
+            return
+        self.send_btn.configure(state='disabled')
+        self.say('Kod gönderiliyor…')
+        self.app.async_.run(self.login.send_code(phone), self._code_sent)
+
+    def _code_sent(self, fut):
+        self.send_btn.configure(state='normal')
+        try:
+            r = fut.result()
+        except Exception as e:
+            self.say(friendly_error(e), RED)
+            return
+        if r == 'zaten':
+            self._logged_in('Zaten giriş yapılmış.')
+            return
+        self.code.configure(state='normal')
+        self.code_btn.configure(state='normal')
+        self.code.focus_set()
+        self.say('Kod Telegram uygulamana gönderildi. Kodu yazıp "Giriş yap"a bas.')
+
+    def sign_in(self):
+        code = self.code.get().strip().replace(' ', '')
+        if not code or self.code_btn.instate(['disabled']):
+            return
+        self.code_btn.configure(state='disabled')
+        self.say('Giriş yapılıyor…')
+        self.app.async_.run(self.login.sign_in(code), self._signed_in)
+
+    def _signed_in(self, fut):
+        self.code_btn.configure(state='normal')
+        try:
+            r = fut.result()
+        except Exception as e:
+            self.say(friendly_error(e), RED)
+            return
+        if r == 'sifre':
+            self.pw.configure(state='normal')
+            self.pw_btn.configure(state='normal')
+            self.pw.focus_set()
+            self.say('Hesabında iki adımlı doğrulama var. Şifreni yazıp "Onayla"ya bas.')
+        else:
+            self._logged_in('Giriş tamam.')
+
+    def send_password(self):
+        pw = self.pw.get()
+        if not pw or self.pw_btn.instate(['disabled']):
+            return
+        self.pw_btn.configure(state='disabled')
+        self.app.async_.run(self.login.password(pw), self._pw_done)
+
+    def _pw_done(self, fut):
+        self.pw_btn.configure(state='normal')
+        try:
+            fut.result()
+        except Exception as e:
+            self.say(friendly_error(e), RED)
+            return
+        self._logged_in('Giriş tamam.')
+
+    def _logged_in(self, text):
+        self.logged_in = True
+        for w in (self.phone, self.send_btn, self.code, self.code_btn, self.pw, self.pw_btn):
+            w.configure(state='disabled')
+        self.say('✔ ' + text, GREEN)
+        self.on_login()
+
+    def reset(self, text):
+        """Baştan (başka bir hesapla) giriş için."""
+        self.login = TelegramLogin()
+        self.logged_in = False
+        for w in (self.code, self.pw):
+            w.configure(state='normal')
+            w.delete(0, 'end')
+            w.configure(state='disabled')
+        for w in (self.code_btn, self.pw_btn):
+            w.configure(state='disabled')
+        for w in (self.phone, self.send_btn):
+            w.configure(state='normal')
+        self.say(text, ORANGE)
+
+
+class LoginView(ttk.Frame):
+    """Kurulu programda sadece Telegram'a yeniden giriş (çıkış yaptıktan ya da oturum kapandıktan sonra).
+    Klasörler, hız ayarları ve yedek kayıtları olduğu gibi kalır."""
+
+    def __init__(self, app):
+        super().__init__(app, padding=(24, 18))
+        self.app = app
+        self.new_archive = False
+        ttk.Label(self, text='Telegram girişi', style='Title.TLabel').pack(anchor='w')
+        ttk.Label(self, text='Klasörlerin, hız ayarların ve Telegram\'daki yedeklerin olduğu gibi duruyor; '
+                             'yedeklemenin sürmesi için tekrar giriş yapman yeterli.',
+                  style='Muted.TLabel', wraplength=900).pack(anchor='w', pady=(2, 0))
+        h = kk.load_config().get('hesap')
+        if h:
+            ttk.Label(self, text=f'Arşiv grubu şu hesapta: {account_text(h)}. Aynı hesapla girersen kaldığı yerden '
+                                 'devam eder.', style='Muted.TLabel', wraplength=900).pack(anchor='w', pady=(2, 0))
+        self.box = LoginBox(self, app, ' Telegram hesabı ', self._on_login)
+        self.box.pack(fill='x', pady=(14, 0))
+        bottom = ttk.Frame(self)
+        bottom.pack(fill='x', pady=(14, 0))
+        self.msg = ttk.Label(bottom, text='', style='Muted.TLabel', wraplength=760, justify='left')
+        self.msg.pack(side='left')
+        self.retry_btn = ttk.Button(bottom, text='Tekrar dene', command=self._on_login)
+        self.box.check_existing()
+
+    def _on_login(self):
+        self.retry_btn.pack_forget()
+        self.msg.configure(text='Arşiv grubu kontrol ediliyor…', foreground=GREY)
+        self.app.async_.run(self.box.login.finish(allow_new=False), self._checked)
+
+    def _checked(self, fut):
+        try:
+            state, info = fut.result()
+        except Exception as e:
+            self.msg.configure(text=f'Olmadı: {friendly_error(e)}', foreground=RED)
+            self.retry_btn.pack(side='right')
+            return
+        if state == 'erisim_yok':
+            if messagebox.askyesno('Klip Kalkanı', f'{account_text(info)} hesabında Klip Kalkanı arşiv grubu yok; '
+                                   'yedeklerin başka bir hesapta duruyor olabilir.\n\n'
+                                   'Bu hesapta yeni bir arşiv grubu açılsın ve bütün klipler baştan buraya '
+                                   'yüklensin mi?\n\n"Hayır" dersen bu hesaptan çıkılır; doğru hesapla tekrar '
+                                   'girebilirsin.'):
+                self.msg.configure(text='Yeni arşiv grubu açılıyor…', foreground=GREY)
+                self.app.async_.run(self.box.login.finish(allow_new=True), self._checked)
+            else:
+                self.msg.configure(text='Bu hesaptan çıkılıyor…', foreground=GREY)
+                self.app.async_.run(self.box.login.cancel(), self._cancelled)
+            return
+        self.new_archive = state == 'yeni'
+        self.msg.configure(text='Yedekleme yeniden başlatılıyor…', foreground=GREY)
+        self.app.bg(self._resume, self._resumed)
+
+    def _cancelled(self, fut):
+        try:
+            fut.result()
+        except Exception as e:
+            print('çıkış:', e)
+        self.msg.configure(text='')
+        self.box.reset('Çıkış yapıldı. Doğru hesabın numarasıyla tekrar giriş yap.')
+
+    @staticmethod
+    def _resume():
+        """Yükleyici eski oturumla bekliyorsa kapatıp yeni girişle başlatır. Duraklatılmışsa öyle kalır."""
+        kk.stop_uploader()
+        if kk.load_config().get('duraklat'):
+            return False
+        if kk.task_state() == 'yok':
+            kk.register_task()
+        else:
+            kk.start_task()
+        return True
+
+    def _resumed(self, res):
+        ok, started = res
+        text = ('Yeni arşiv grubu açıldı; klipler bu hesaba baştan yüklenecek.' if self.new_archive
+                else 'Giriş tamam.')
+        if not ok:
+            text += f'\n\nOtomatik başlatma açılamadı: {started}'
+        elif not started:
+            text += ' Yedekleme duraklatılmış durumda; Durum sekmesindeki "Devam et" ile sürdürebilirsin.'
+        elif not self.new_archive:
+            text += ' Yedekleme kaldığı yerden devam ediyor.'
+        messagebox.showinfo('Klip Kalkanı', text)
+        self.app.show(DashboardView)
+
+
 # ---------------------------------------------------------------- kurulum ekranı
 
 class SetupView(ttk.Frame):
     def __init__(self, app):
         super().__init__(app, padding=(24, 18))
         self.app = app
-        self.login = TelegramLogin()
         self.folder_vars = []   # (BooleanVar, src)
         self.logged_in = False
 
@@ -467,30 +782,8 @@ class SetupView(ttk.Frame):
         self.speed_msg.pack(side='left', padx=10)
 
         # 3) telegram
-        box = ttk.LabelFrame(self, text=' 3. Telegram girişi ', padding=12)
-        box.pack(fill='x', pady=(12, 0))
-        r = ttk.Frame(box)
-        r.pack(fill='x')
-        ttk.Label(r, text='Telefon:').pack(side='left')
-        self.phone = ttk.Entry(r, width=20)
-        self.phone.insert(0, '+90')
-        self.phone.pack(side='left', padx=6)
-        self.send_btn = ttk.Button(r, text='Kod gönder', command=self.send_code)
-        self.send_btn.pack(side='left')
-        ttk.Label(r, text='   Kod:').pack(side='left')
-        self.code = ttk.Entry(r, width=10, state='disabled')
-        self.code.pack(side='left', padx=6)
-        self.code_btn = ttk.Button(r, text='Giriş yap', command=self.sign_in, state='disabled')
-        self.code_btn.pack(side='left')
-        r2 = ttk.Frame(box)
-        r2.pack(fill='x', pady=(8, 0))
-        ttk.Label(r2, text='İki adımlı şifre (varsa):').pack(side='left')
-        self.pw = ttk.Entry(r2, width=22, show='•', state='disabled')
-        self.pw.pack(side='left', padx=6)
-        self.pw_btn = ttk.Button(r2, text='Onayla', command=self.send_password, state='disabled')
-        self.pw_btn.pack(side='left')
-        self.tg_msg = ttk.Label(box, text='Kod, telefonundaki Telegram uygulamasına gelir.', style='Muted.TLabel')
-        self.tg_msg.pack(anchor='w', pady=(8, 0))
+        self.box = LoginBox(self, app, ' 3. Telegram girişi ', self._on_login, self._save_api)
+        self.box.pack(fill='x', pady=(12, 0))
 
         # bitir
         bottom = ttk.Frame(self)
@@ -505,7 +798,7 @@ class SetupView(ttk.Frame):
 
         self.app.bg(self._detect, self._detected)
         if not self.need_api:
-            self.app.async_.run(self.login.is_authorized(), self._auth_checked)
+            self.box.check_existing()
 
     # --- klasörler
     @staticmethod
@@ -559,87 +852,19 @@ class SetupView(ttk.Frame):
         self.speed_msg.configure(text=f'Upload hızın ~{val:.0f} Mbit. Gündüz internetine yer kalsın diye daha düşük seçildi.')
 
     # --- telegram
-    def _auth_checked(self, fut):
-        try:
-            if fut.result():
-                self._logged_in('Bu bilgisayarda zaten giriş yapılmış.')
-        except Exception as e:
-            self.tg_msg.configure(text=f'Telegram\'a bağlanılamadı: {friendly_error(e)}')
+    def _save_api(self):
+        """Kod istenmeden önce: API bilgisi paketle gelmediyse kutulardan alınır."""
+        if not self.need_api:
+            return True
+        api_id, api_hash = self.api_id.get().strip(), self.api_hash.get().strip()
+        if not api_id.isdigit() or len(api_hash) != 32:
+            self.box.say('Önce yukarıya api_id (sadece rakam) ve api_hash\'i (32 karakter) yaz.', ORANGE)
+            return False
+        update_config(api_id=int(api_id), api_hash=api_hash)
+        return True
 
-    def send_code(self):
-        phone = self.phone.get().strip().replace(' ', '')
-        if len(phone) < 8:
-            self.tg_msg.configure(text='Telefon numaranı başında + ile yaz (örn. +905xxxxxxxxx).')
-            return
-        if self.need_api:
-            api_id, api_hash = self.api_id.get().strip(), self.api_hash.get().strip()
-            if not api_id.isdigit() or len(api_hash) != 32:
-                self.tg_msg.configure(text='Önce yukarıya api_id (sadece rakam) ve api_hash\'i (32 karakter) yaz.')
-                return
-            update_config(api_id=int(api_id), api_hash=api_hash)
-        self.send_btn.configure(state='disabled')
-        self.tg_msg.configure(text='Kod gönderiliyor…')
-        self.app.async_.run(self.login.send_code(phone), self._code_sent)
-
-    def _code_sent(self, fut):
-        self.send_btn.configure(state='normal')
-        try:
-            r = fut.result()
-        except Exception as e:
-            self.tg_msg.configure(text=friendly_error(e))
-            return
-        if r == 'zaten':
-            self._logged_in('Zaten giriş yapılmış.')
-            return
-        self.code.configure(state='normal')
-        self.code_btn.configure(state='normal')
-        self.code.focus_set()
-        self.tg_msg.configure(text='Kod Telegram uygulamana gönderildi. Kodu yazıp "Giriş yap"a bas.')
-
-    def sign_in(self):
-        code = self.code.get().strip().replace(' ', '')
-        if not code:
-            return
-        self.code_btn.configure(state='disabled')
-        self.tg_msg.configure(text='Giriş yapılıyor…')
-        self.app.async_.run(self.login.sign_in(code), self._signed_in)
-
-    def _signed_in(self, fut):
-        self.code_btn.configure(state='normal')
-        try:
-            r = fut.result()
-        except Exception as e:
-            self.tg_msg.configure(text=friendly_error(e))
-            return
-        if r == 'sifre':
-            self.pw.configure(state='normal')
-            self.pw_btn.configure(state='normal')
-            self.pw.focus_set()
-            self.tg_msg.configure(text='Hesabında iki adımlı doğrulama var. Şifreni yazıp "Onayla"ya bas.')
-        else:
-            self._logged_in('Giriş tamam.')
-
-    def send_password(self):
-        pw = self.pw.get()
-        if not pw:
-            return
-        self.pw_btn.configure(state='disabled')
-        self.app.async_.run(self.login.password(pw), self._pw_done)
-
-    def _pw_done(self, fut):
-        self.pw_btn.configure(state='normal')
-        try:
-            fut.result()
-        except Exception as e:
-            self.tg_msg.configure(text=friendly_error(e))
-            return
-        self._logged_in('Giriş tamam.')
-
-    def _logged_in(self, text):
+    def _on_login(self):
         self.logged_in = True
-        for w in (self.phone, self.send_btn, self.code, self.code_btn, self.pw, self.pw_btn):
-            w.configure(state='disabled')
-        self.tg_msg.configure(text='✔ ' + text, foreground=GREEN)
         self._update_finish()
 
     # --- bitir
@@ -662,7 +887,7 @@ class SetupView(ttk.Frame):
         update_config(kaynaklar=sources, hiz_plani=make_plan(day, night), max_hiz_mbit=day, duraklat=False)
         self.finish_btn.configure(state='disabled')
         self.finish_msg.configure(text='Telegram\'da gizli arşiv grubu hazırlanıyor…')
-        self.app.async_.run(self.login.finish(), self._archive_ready)
+        self.app.async_.run(self.box.login.finish(), self._archive_ready)
 
     def _archive_ready(self, fut):
         try:
@@ -672,11 +897,12 @@ class SetupView(ttk.Frame):
             self.finish_msg.configure(text=friendly_error(e))
             return
         self.finish_msg.configure(text='Otomatik başlatma kuruluyor…')
-        self.app.bg(self._install, self._installed)
+        self.app.bg(self._install, self._installed, self.shortcut.get())
 
-    def _install(self):
+    @staticmethod
+    def _install(shortcut):
         kk.register_task()
-        if self.shortcut.get():
+        if shortcut:
             make_desktop_shortcut()
         return True
 
@@ -699,6 +925,8 @@ class DashboardView(ttk.Frame):
         self.stats = None
         self.stats_busy = False
         self._ts = (0, 'acik')
+        self._tick_job = self._stats_job = None
+        self._acc_loaded = self._acc_busy = False
 
         head = ttk.Frame(self)
         head.pack(fill='x')
@@ -732,8 +960,24 @@ class DashboardView(ttk.Frame):
             self.editor = duzenle.EditorTab(f, app)
         except ImportError:
             pass
+        f = ttk.Frame(nb, padding=16)
+        nb.add(f, text='  Ayarlar  ')
+        self.tabs['settings'] = f
+        self._build_settings()
         self._tick()
         self._refresh_stats()
+
+    def destroy(self):
+        """Çıkış yapınca ekran değişir: zamanlayıcıları ve açık klibin oynatıcısını kapat."""
+        for job in (self._tick_job, self._stats_job):
+            if job:
+                try:
+                    self.after_cancel(job)
+                except tk.TclError:
+                    pass
+        if self.editor is not None:
+            self.editor.close()
+        super().destroy()
 
     def _tab_changed(self, _e):
         tab = self.nb.select()
@@ -741,6 +985,8 @@ class DashboardView(ttk.Frame):
             self.load_folders()
         elif tab == str(self.tabs['restore']):
             self.load_restore_choices()
+        elif tab == str(self.tabs['settings']):
+            self.load_account()
 
     # ------------------------------------------------ Durum
     def _build_status(self):
@@ -872,7 +1118,7 @@ class DashboardView(ttk.Frame):
             self._set_state(GREY, d or '…', s.get('sebep') or '')
         self.bg_label.configure(text=f'Arka plan: {"çalışıyor" if alive else "kapalı"}  ·  '
                                      f'Hız sınırı: {self._limit_text(cfg)}')
-        self.after(1000, self._tick)
+        self._tick_job = self.after(1000, self._tick)
 
     @staticmethod
     def _limit_text(cfg):
@@ -915,10 +1161,12 @@ class DashboardView(ttk.Frame):
         if not self.stats_busy:
             self.stats_busy = True
             self.app.bg(collect_stats, self._stats_ready)
-        self.after(15000, self._refresh_stats)
+        self._stats_job = self.after(15000, self._refresh_stats)
 
     def _stats_ready(self, res):
         self.stats_busy = False
+        if not self.winfo_exists():  # bu arada ekran değişmiş (ör. çıkış yapıldı)
+            return
         ok, st = res
         if not ok:
             self.tot_title.configure(text=f'Özet okunamadı: {st}')
@@ -999,13 +1247,13 @@ class DashboardView(ttk.Frame):
             os.startfile(p)
 
     def relogin(self):
-        if messagebox.askyesno('Klip Kalkanı', 'Telegram girişini yenilemek için kurulum ekranı açılsın mı?\n'
-                                              '(Klasörler ve yedekler aynen kalır.)'):
+        if messagebox.askyesno('Klip Kalkanı', 'Telegram girişini yenilemek için giriş ekranı açılsın mı?\n'
+                                              '(Klasörler, ayarlar ve yedekler aynen kalır.)'):
             try:
                 os.replace(kk.SESSION_FILE, kk.SESSION_FILE + '.eski')
             except OSError:
                 pass
-            self.app.show(SetupView)
+            self.app.show(LoginView)
 
     # ------------------------------------------------ Oyunlar
     def _build_games(self):
@@ -1181,6 +1429,141 @@ class DashboardView(ttk.Frame):
         kk.save_config(cfg)
         self.load_folders()
         self.folder_msg.configure(text='Sıra değişti. Şu anki dosya bitince yeni sıraya geçer.')
+
+    # ------------------------------------------------ Ayarlar
+    def _build_settings(self):
+        t = self.tabs['settings']
+        box = ttk.LabelFrame(t, text=' Telegram hesabı ', padding=12)
+        box.pack(fill='x')
+        r = ttk.Frame(box)
+        r.pack(fill='x')
+        self.acc_label = ttk.Label(r, text='—', style='H2.TLabel')
+        self.acc_label.pack(side='left')
+        self.logout_btn = ttk.Button(r, text='Çıkış yap', command=self.logout)
+        self.logout_btn.pack(side='right')
+        self.acc_sub = ttk.Label(box, text='', style='Muted.TLabel', wraplength=880, justify='left')
+        self.acc_sub.pack(anchor='w', pady=(4, 0))
+        ttk.Label(box, text='Çıkış yapınca yedekleme durur ve bu bilgisayardaki giriş silinir; Telegram\'daki arşiv '
+                            'grubu ve klipler olduğu gibi kalır. Aynı hesapla tekrar girince kaldığı yerden devam eder.',
+                  style='Muted.TLabel', wraplength=880, justify='left').pack(anchor='w', pady=(8, 0))
+        h = kk.load_config().get('hesap')
+        if h:
+            self._show_account(h)
+
+        box = ttk.LabelFrame(t, text=' Güncelleme ', padding=12)
+        box.pack(fill='x', pady=(14, 0))
+        r = ttk.Frame(box)
+        r.pack(fill='x')
+        ttk.Label(r, text=f'Yüklü sürüm: {kk.VERSION}', style='H2.TLabel').pack(side='left')
+        ttk.Button(r, text='Sürüm notları', command=lambda: webbrowser.open(
+            f'https://github.com/{kk.GUNCELLEME_REPO}/releases')).pack(side='right')
+        self.upd_btn = ttk.Button(r, text='Güncellemeleri kontrol et', style='Accent.TButton',
+                                  command=self.check_updates)
+        self.upd_btn.pack(side='right', padx=8)
+        self.upd_msg = ttk.Label(box, text='', style='Muted.TLabel', wraplength=880, justify='left')
+        self.upd_msg.pack(anchor='w', pady=(6, 0))
+        ttk.Label(box, text='Program açılışta ve arka planda 6 saatte bir kendiliğinden de bakar; yeni sürüm varsa '
+                            'kendisi kurar.', style='Muted.TLabel', wraplength=880).pack(anchor='w', pady=(2, 0))
+        self.show_update_info()
+
+    def _show_account(self, h):
+        self.acc_label.configure(text=account_text(h))
+        bits = []
+        if h.get('tel_son'):
+            bits.append(f'Telefon: •••• {h["tel_son"]}')
+        bits.append('Premium: var (4 GB\'a kadar tek parça)' if h.get('premium')
+                    else 'Premium: yok (2 GB üstü parçalı gider)')
+        bits.append(f'Arşiv grubu: {kk.load_config().get("kanal_adi")}')
+        self.acc_sub.configure(text='  ·  '.join(bits), foreground=GREY)
+
+    def load_account(self):
+        """Hesap bilgisini Telegram'dan tazeler (pencere başına bir kere)."""
+        if self._acc_loaded or self._acc_busy:
+            return
+        self._acc_busy = True
+        if not kk.load_config().get('hesap'):
+            self.acc_label.configure(text='Hesap bilgisi alınıyor…')
+        self.app.async_.run(self._fetch_account(), self._account_fetched)
+
+    @staticmethod
+    async def _fetch_account():
+        client = await kk.connect(kk.load_config())
+        try:
+            me = await client.get_me()
+        finally:
+            await client.disconnect()
+        return kk.remember_account(kk.account_info(me))
+
+    def _account_fetched(self, fut):
+        self._acc_busy = False
+        if not self.winfo_exists():  # bu arada çıkış yapılmış
+            return
+        try:
+            h = fut.result()
+        except Exception as e:
+            if type(e).__name__ == 'NotLoggedIn':
+                self.acc_label.configure(text='Telegram oturumu kapalı')
+                self.acc_sub.configure(text='Durum sekmesindeki "Telegram girişini yenile" ile tekrar giriş yap.',
+                                       foreground=ORANGE)
+            elif not kk.load_config().get('hesap'):
+                self.acc_label.configure(text='Hesap bilgisi alınamadı')
+                self.acc_sub.configure(text=friendly_error(e), foreground=ORANGE)
+            return
+        self._acc_loaded = True
+        self._show_account(h)
+
+    def logout(self):
+        if self.restore_future and not self.restore_future.done():
+            messagebox.showinfo('Klip Kalkanı', 'Önce Geri Yükle sekmesindeki indirmeyi durdur.')
+            return
+        h = kk.load_config().get('hesap')
+        who = f' ({account_text(h)})' if h else ''
+        if not messagebox.askyesno('Klip Kalkanı', f'Telegram hesabından{who} çıkış yapılsın mı?\n\n'
+                                   '• Yedekleme durur; tekrar giriş yapınca kaldığı yerden sürer.\n'
+                                   '• Telegram\'daki arşiv grubu ve klipler silinmez.\n'
+                                   '• Bu bilgisayar, Telegram\'daki cihaz listenden de çıkar.'):
+            return
+        self.logout_btn.configure(state='disabled')
+        self.acc_sub.configure(text='Çıkış yapılıyor…', foreground=GREY)
+        self.app.async_.run(kk.telegram_logout(prepare=kk.stop_backup), self._logged_out)
+
+    def _logged_out(self, fut):
+        try:
+            fut.result()
+        except Exception as e:
+            self.logout_btn.configure(state='normal')
+            self.acc_sub.configure(text=f'Çıkış yapılamadı: {friendly_error(e)}', foreground=RED)
+            return
+        self.app.show(LoginView)
+
+    def check_updates(self):
+        self.app.check_updates(manual=True)
+
+    def show_update_info(self):
+        """Son güncelleme kontrolünün sonucunu yazar (açılıştaki otomatik kontrol ya da düğme)."""
+        busy = self.app.update_busy
+        self.upd_btn.configure(state='disabled' if busy else 'normal')
+        if busy:
+            self.upd_msg.configure(text='GitHub\'a bakılıyor…', foreground=GREY)
+            return
+        if self.app.update_info is None:
+            self.upd_msg.configure(text='')
+            return
+        when, ok, val = self.app.update_info
+        at = dt.datetime.fromtimestamp(when).strftime('%H:%M')
+        if not ok:
+            text, color = f'Kontrol edilemedi ({at}): {update_error_text(val)}', ORANGE
+        elif val['durum'] == 'guncel':
+            text, color = f'✔ Güncelsin, en son sürüm bu. (Son kontrol {at})', GREEN
+        elif val['durum'] == 'kuruldu':
+            text, color = (f'✔ {val["surum"]} sürümü indirildi ve kuruldu. Yukarıdaki "Yeni sürümü aç"a basınca '
+                           'geçer.'), GREEN
+        elif val['durum'] == 'gelistirici':
+            text, color = (f'Bu bir geliştirici kopyası (git), kendini güncellemez. GitHub\'daki son sürüm: '
+                           f'{val["uzak"]}. (Son kontrol {at})'), GREY
+        else:
+            text, color = 'Otomatik güncelleme bu kopyada kapalı.', GREY
+        self.upd_msg.configure(text=text, foreground=color)
 
     # ------------------------------------------------ Geri Yükle
     def _build_restore(self):

@@ -485,7 +485,17 @@ class EditorTab:
         nb.add(merge, text='  Birleştir  ')
         self._build_cut(cut)
         self._build_merge(merge)
+        self._loop_job = None
         self._frame_loop()
+
+    def close(self):
+        """Pencerede ekran değişirken (ör. Telegram çıkışı): ekran döngüsünü ve oynatıcıyı kapatır."""
+        if self._loop_job:
+            self.parent.after_cancel(self._loop_job)
+            self._loop_job = None
+        if self.player:
+            self.player.close()
+            self.player = None
 
     # ------------------------------------------------ Kes
     def _build_cut(self, t):
@@ -689,7 +699,7 @@ class EditorTab:
                 self._fps_shown_at = now
             if not p.playing and self.play_btn.cget('text') != '▶ Oynat' and not p._pending():
                 self.play_btn.configure(text='▶ Oynat')
-        self.parent.after(4, self._frame_loop)
+        self._loop_job = self.parent.after(4, self._frame_loop)
 
     # seçim
     def set_a(self):

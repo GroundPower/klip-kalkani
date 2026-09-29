@@ -11,7 +11,8 @@ Oyun kliplerini (Medal, NVIDIA, Outplayed, OBS, Xbox Game Bar…) **Telegram'da 
 - **Kopyaları ayıklar:** Aynı klip farklı klasörlerde olsa da bir kere yüklenir.
 - **Geri yükleme:** Oyuna, aya ya da isme göre seçip indirir. Her parça SHA-256 ile orijinaline karşı doğrulanır.
 - **Düzenle:** Sesli önizleme (60 FPS / tam FPS), zaman çubuğu, A–B seçimi, **kayıpsız kesme** (saniyeler sürer), **tam kare kesme** (NVIDIA NVENC) ve **kayıpsız birleştirme**.
-- **Kendini günceller:** Yeni sürümler bu repodan otomatik iner. Dosyalar özetleriyle doğrulanır, eski sürüm `eski_surum/` klasöründe yedeklenir.
+- **Kendini günceller:** Yeni sürümler bu repodan otomatik iner. Dosyalar özetleriyle doğrulanır, eski sürüm `eski_surum/` klasöründe yedeklenir. Ayarlar sekmesindeki "Güncellemeleri kontrol et" ile elle de bakılır.
+- **Hesap ve çıkış:** Ayarlar sekmesi yedeklerin hangi Telegram hesabına gittiğini gösterir. "Çıkış yap" bu bilgisayardaki girişi kapatır (Telegram'ın cihaz listesinden de düşer); yedekler Telegram'da kalır. Aynı hesapla tekrar girince kaldığı yerden sürer. Başka bir hesapla girilirse o hesapta yeni bir arşiv grubu açılır.
 - **Hiçbir şey silmez:** Ne bilgisayardaki dosyalara ne de Telegram'daki yedeklere dokunur.
 
 ## Kurulum
@@ -35,8 +36,8 @@ Python kurmana gerek yok. Paket kendi taşınabilir Python'uyla gelir.
 
 | Dosya | Görevi |
 |---|---|
-| `klip_kalkani.py` | Yedekleme motoru ve komut satırı: `calis`, `tara`, `durum`, `geri-yukle`, `dogrula`, `indeks-yenile`, `kaldir` |
-| `arayuz.pyw` | Pencere: kurulum, durum, hız, oyunlar, klasörler, geri yükleme |
+| `klip_kalkani.py` | Yedekleme motoru ve komut satırı: `calis`, `tara`, `durum`, `geri-yukle`, `dogrula`, `indeks-yenile`, `cikis`, `kaldir` |
+| `arayuz.pyw` | Pencere: kurulum, durum, hız, oyunlar, klasörler, geri yükleme, ayarlar (hesap, çıkış, güncelleme) |
 | `duzenle.py` | Önizleme, kesme ve birleştirme (PyAV) |
 | `paket_yap.py` | Taşınabilir zip'i yapar: `python paket_yap.py [--api varsayilan.json]` |
 | `yayinla.py` | Yeni sürüm için `surum.json`'u üretir |

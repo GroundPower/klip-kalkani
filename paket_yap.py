@@ -51,9 +51,12 @@ NE YAPAR
 
 GÜNCELLEME
 - Program kendini GitHub'dan otomatik günceller; bir şey yapmana gerek yok. Sürüm pencerenin başlığında yazar.
+- Hemen bakmak istersen: Ayarlar sekmesi > "Güncellemeleri kontrol et".
 
 DİĞER
 - Masaüstündeki "Klip Kalkanı" kısayolu: durum, Duraklat/Devam, hız, oyunlar, klasörler, geri yükleme, düzenleme.
+- Ayarlar sekmesi: hangi Telegram hesabına yedeklendiğini gösterir. "Çıkış yap" bu bilgisayardaki girişi kapatır;
+  yedekler Telegram'da kalır, aynı hesapla tekrar girince kaldığı yerden sürer.
 - "Otomatik Başlatmayı Kaldır.bat": arka planda çalışmayı kapatır (dosyalara ve yedeklere dokunmaz).
 - Telegram, hesap başına indirmeyi ~6 MB/sn ile sınırlar; toplu geri yükleme biraz sürer.
 - klip_kalkani.session dosyası Telegram hesabına erişim demektir, KİMSEYLE PAYLAŞMA.
