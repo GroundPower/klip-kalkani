@@ -46,7 +46,7 @@ import time
 
 import psutil
 
-VERSION = '1.7'
+VERSION = '1.7.1'
 BASE = os.path.dirname(os.path.abspath(__file__))  # program dosyaları
 APPDATA_DIR = os.path.join(os.environ.get('APPDATA') or os.path.join(os.path.expanduser('~'), 'AppData', 'Roaming'),
                            'KlipKalkani')

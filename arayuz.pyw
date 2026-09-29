@@ -36,6 +36,7 @@ except ImportError:  # tema yoksa düz ttk ile de çalışır
 
 ICON_PATH = os.path.join(BASE, 'kalkan.ico')
 LAUNCHER = os.path.join(BASE, 'Klip Kalkanı.exe')
+SHORTCUT_NOTE = "Klip Kalkanı: oyun kliplerini Telegram'a yedekler"
 FOLDERID_DESKTOP = '{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}'
 FOLDERID_PROGRAMS = '{A77F5D77-2E2B-44C3-A6A2-ABA601054A51}'  # Başlat menüsü > Programlar
 UNLIMITED = 100000
@@ -172,7 +173,7 @@ def shortcut_paths():
 
 def make_shortcut(lnk):
     """Klip Kalkanı.exe'ye (yoksa pythonw + arayuz.pyw'ye) kısayol yapar."""
-    def q(s):
+    def q(s):  # PowerShell tek tırnaklı metin (içindeki ' ikilenir)
         return "'" + s.replace("'", "''") + "'"
     if os.path.exists(LAUNCHER):
         target, arguments, icon = LAUNCHER, '', LAUNCHER + ',0'
@@ -182,12 +183,12 @@ def make_shortcut(lnk):
     script = (f"$s = (New-Object -ComObject WScript.Shell).CreateShortcut({q(lnk)}); "
               f"$s.TargetPath = {q(target)}; $s.Arguments = {q(arguments)}; $s.WorkingDirectory = {q(BASE)}; "
               + (f"$s.IconLocation = {q(icon)}; " if icon else '')
-              + "$s.Description = 'Klip Kalkanı: oyun kliplerini Telegram\'a yedekler'; $s.Save()")
+              + f"$s.Description = {q(SHORTCUT_NOTE)}; $s.Save()")
     enc = base64.b64encode(script.encode('utf-16-le')).decode()
     r = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-EncodedCommand', enc],
                        capture_output=True, creationflags=NO_WINDOW, timeout=60)
-    if not os.path.exists(lnk):
-        raise RuntimeError(r.stderr.decode('mbcs', 'replace').strip()[-300:] or 'kısayol oluşmadı')
+    if r.returncode != 0 or not os.path.exists(lnk):
+        raise RuntimeError(f'{lnk} yazılamadı')
     return lnk
 
 
