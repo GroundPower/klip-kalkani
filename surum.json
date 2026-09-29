@@ -1,0 +1,21 @@
+{
+  "surum": "1.5",
+  "etiket": "v1.5",
+  "tarih": "2026-09-29",
+  "notlar": "İlk sürüm: otomatik yedek, oyun konuları, önizleme, düzenleyici, otomatik güncelleme",
+  "dosyalar": {
+    "klip_kalkani.py": "8a120761f12ec30e81a8069b44e540705365cb8c3f3ed581d88d6c46dd13f2df",
+    "arayuz.pyw": "1475e92266d2b2ae4bcd0f28b1cd7fc6ae1e8977b5e2b26493d3600bd891d541",
+    "duzenle.py": "27ccf9cf16fe976061d9bfd16b36cdfbb758a35fb64ad27f25476377b2070ffe",
+    "kalkan.ico": "e6190e96224a6adf554c9811b09a956be68943c4d48433d8e4435aeaee971504"
+  },
+  "gereken_moduller": [
+    "telethon",
+    "cryptg",
+    "psutil",
+    "av",
+    "PIL",
+    "sv_ttk",
+    "sounddevice"
+  ]
+}

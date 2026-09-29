@@ -1,0 +1,49 @@
+# 🛡 Klip Kalkanı
+
+Oyun kliplerini (Medal, NVIDIA, Outplayed, OBS, Xbox Game Bar…) **Telegram'da sadece senin göreceğin gizli bir gruba** otomatik yedekleyen Windows programı. Disk bozulsa da klipler kaybolmaz.
+
+## Neler yapar
+
+- **Otomatik yedek:** Klip klasörlerini kendisi bulur, yeni klipleri arka planda yükler. Bilgisayar her açıldığında kendiliğinden çalışır.
+- **Orijinal kalite:** Dosyalar yeniden sıkıştırılmaz. Telegram'da önizlemeli video olarak durur, telefondan izlenir. 2 GB'tan büyük dosyalar (Premium'da 4 GB) parçalı yüklenir, geri indirilirken birleştirilir.
+- **Her oyun ayrı konuda:** Arşiv, forum modundaki bir grup. League of Legends, Valorant, Apex… her birinin kendi konusu var.
+- **Oyunu bozmaz:** Oyun açıkken yükleme durur. Gündüz ve gece için ayrı hız sınırı konabilir.
+- **Kopyaları ayıklar:** Aynı klip farklı klasörlerde olsa da bir kere yüklenir.
+- **Geri yükleme:** Oyuna, aya ya da isme göre seçip indirir. Her parça SHA-256 ile orijinaline karşı doğrulanır.
+- **Düzenle:** Sesli önizleme (60 FPS / tam FPS), zaman çubuğu, A–B seçimi, **kayıpsız kesme** (saniyeler sürer), **tam kare kesme** (NVIDIA NVENC) ve **kayıpsız birleştirme**.
+- **Kendini günceller:** Yeni sürümler bu repodan otomatik iner. Dosyalar özetleriyle doğrulanır, eski sürüm `eski_surum/` klasöründe yedeklenir.
+- **Hiçbir şey silmez:** Ne bilgisayardaki dosyalara ne de Telegram'daki yedeklere dokunur.
+
+## Kurulum
+
+1. [Releases](../../releases) sayfasından `KlipKalkani-<sürüm>.zip`'i indir. Kalıcı bir klasöre çıkar (ör. `C:\KlipKalkani`).
+2. `Klip Kalkanı.bat`'a çift tıkla. Kurulum penceresi seni adım adım götürür:
+   - Klip klasörleri
+   - Hız ayarı
+   - Telegram API bilgisi (bir kere): [my.telegram.org](https://my.telegram.org/apps) → *API development tools*
+   - Telefonla Telegram girişi
+
+Python kurmana gerek yok. Paket kendi taşınabilir Python'uyla gelir.
+
+## Gizlilik
+
+- Klipler sadece senin Telegram hesabındaki gizli gruba gider. Başka bir sunucu yok.
+- Telegram oturumu (`klip_kalkani.session`), ayarlar ve veritabanı sadece senin bilgisayarında durur. Repoya hiçbir zaman girmez (`.gitignore` yalnızca program dosyalarına izin verir).
+- İnternet hızı ölçümü için Cloudflare'in hız testi adresine rastgele veri gönderilir. Kişisel veri gitmez.
+
+## Geliştirici notları
+
+| Dosya | Görevi |
+|---|---|
+| `klip_kalkani.py` | Yedekleme motoru ve komut satırı: `calis`, `tara`, `durum`, `geri-yukle`, `dogrula`, `indeks-yenile`, `kaldir` |
+| `arayuz.pyw` | Pencere: kurulum, durum, hız, oyunlar, klasörler, geri yükleme |
+| `duzenle.py` | Önizleme, kesme ve birleştirme (PyAV) |
+| `paket_yap.py` | Taşınabilir zip'i yapar: `python paket_yap.py [--api varsayilan.json]` |
+| `yayinla.py` | Yeni sürüm için `surum.json`'u üretir |
+
+Yeni sürüm yayınlamak için:
+
+1. `VERSION`'ı artır.
+2. `python yayinla.py "not"` çalıştır.
+3. Commit at, `v<sürüm>` etiketini ekle, push et.
+4. İstersen `paket_yap.py` ile yaptığın zip'i Releases'e ekle.

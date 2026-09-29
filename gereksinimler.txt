@@ -1,0 +1,7 @@
+telethon>=1.45
+cryptg>=0.6
+psutil>=7
+av>=18
+pillow>=12
+sv-ttk>=2.6
+sounddevice>=0.5

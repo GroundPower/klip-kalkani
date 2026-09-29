@@ -1,0 +1,14 @@
+# Sadece aşağıda izin verilen dosyalar repoya girebilir.
+# Ayarlar, Telegram oturumu, veritabanı, loglar ve API bilgileri ASLA yüklenmez.
+*
+!.gitignore
+!.gitattributes
+!README.md
+!gereksinimler.txt
+!surum.json
+!klip_kalkani.py
+!arayuz.pyw
+!duzenle.py
+!kalkan.ico
+!yayinla.py
+!paket_yap.py
