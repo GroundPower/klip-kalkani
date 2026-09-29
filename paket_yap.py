@@ -45,9 +45,18 @@ NE YAPAR
   kanalda birleştir (Discord'da ve telefonda her şey duyulsun) ya da ayrı kanallar olarak kaydet.
 - Hiçbir dosyayı silmez, taşımaz. Aynı klip iki kere yüklenmez.
 
+ARKA PLAN VE KAPATMA
+- Yedekleme pencereden bağımsız, arka planda çalışır; o sırada saatin yanında Klip Kalkanı simgesi durur
+  (üstüne gelince ne yaptığını söyler). Tıklayınca pencere açılır; sağ tıkta duraklat, şimdi tara, Çıkış.
+- Pencereyi kapatırken sorar: yedekleme arka planda sürsün mü, tamamen mi kapansın? Tamamen kapatınca
+  (ya da simgeden Çıkış) yedekleme durur; pencereyi açınca ya da bilgisayar yeniden açılınca kaldığı yerden sürer.
+  Program > Tamamen kapat (Ctrl+Q) aynı işi yapar. Görev Yöneticisi'nden kapatmaya gerek yok.
+- Durum sekmesi arka planın ne yaptığını yazar. Başlamazsa "Devam et"e bas: takılı kalanı kapatıp yeniden
+  başlatır, olmazsa sebebini yazar (Günlüğü aç ile ayrıntı).
+
 MENÜ (pencerenin üstünde)
 - Program: duraklat/devam (Ctrl+D), "Windows açılınca otomatik başlat" (aç/kapat), masaüstü ve Başlat menüsü
-  kısayolu, program / ayar klasörü, günlük, "Programı kaldır".
+  kısayolu, program / ayar klasörü, günlük, "Programı kaldır", "Tamamen kapat" (Ctrl+Q).
 - Yedek: klasörleri şimdi tara (F5), Telegram'daki yedekleri doğrula, kayıtları Telegram'dan yeniden kur,
   arşiv grubunu Telegram'da aç, geri yükle, düzenle.
 - Hesap: hangi Telegram hesabı, çıkış yap / Telegram'a bağlan.   Yardım: güncellemeler (Ctrl+U), yardım (F1).

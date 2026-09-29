@@ -13,6 +13,7 @@ import base64
 import collections
 import ctypes
 import datetime as dt
+import logging
 import os
 import queue
 import shutil
@@ -285,7 +286,8 @@ GLYPHS = {'pause': '\uE769', 'play': '\uE768', 'link': '\uE71B', 'pin': '\uE718'
           'settings': '\uE713', 'doc': '\uE8A5', 'delete': '\uE74D', 'close': '\uE711', 'search': '\uE721',
           'check': '\uE73E', 'sync': '\uE895', 'send': '\uE724', 'contact': '\uE77B', 'signout': '\uF3B1',
           'update': '\uE777', 'notes': '\uE70B', 'help': '\uE897', 'info': '\uE946', 'cloud': '\uE753',
-          'shield': '\uEA18', 'login': '\uE8FA', 'download': '\uE896', 'edit': '\uE70F', 'save': '\uE74E'}
+          'shield': '\uEA18', 'login': '\uE8FA', 'download': '\uE896', 'edit': '\uE70F', 'save': '\uE74E',
+          'power': '\uE7E8', 'window': '\uE737'}
 
 
 class MenuBar(tk.Frame):
@@ -493,11 +495,15 @@ class App(tk.Tk):
         self._note_job = None
         self._icons = {}
         self.adv = None           # Gelişmiş ayarlar penceresi
+        self._closing = False     # pencere kapanıyor (güncelleme / kaydetme bitince kapanacak)
+        self._close_t0 = 0.0
+        self.protocol('WM_DELETE_WINDOW', self.on_close)
         self._build_menu()
         for seq, fn in (('<Control-d>', self.menu_pause), ('<Control-D>', self.menu_pause),
                         ('<F5>', self.menu_scan), ('<Control-u>', self.menu_check_updates),
                         ('<Control-U>', self.menu_check_updates), ('<F1>', self.menu_help),
-                        ('<Control-comma>', self.open_advanced)):
+                        ('<Control-comma>', self.open_advanced), ('<Control-q>', self.menu_full_quit),
+                        ('<Control-Q>', self.menu_full_quit)):
             self.bind(seq, lambda _e, fn=fn: self._shortcut(fn))
         self.show(self.first_view())
         self.check_updates()
@@ -576,7 +582,96 @@ class App(tk.Tk):
         ttk.Button(self.banner, text='Yeni sürümü aç', style='Accent.TButton', command=self.restart).pack(side='right')
 
     def restart(self):
-        subprocess.Popen([kk.pythonw_path(), '-E', '-s', os.path.abspath(__file__)], cwd=BASE)
+        # yeni pencere bu pencerenin kapanmasını bekler (tek pencere kuralına takılmasın)
+        subprocess.Popen([kk.pythonw_path(), '-E', '-s', os.path.abspath(__file__), '--bekle', str(os.getpid())],
+                         cwd=BASE)
+        self._begin_close()
+        self.destroy()
+
+    # ------------------------------------------------ kapatma
+    def on_close(self):
+        """Pencerenin X'i ve Alt+F4: arka planda yedekleme varsa sürsün mü diye sorar (ya da ayardaki cevabı uygular)."""
+        if self._closing:
+            return
+        busy = self._busy_text()
+        if busy and not messagebox.askyesno('Klip Kalkanı', f'{busy} sürüyor; pencere kapanırsa yarıda kalır.\n\n'
+                                            'Yine de kapatılsın mı?', icon='warning', parent=self):
+            return
+        choice = 'pencere'
+        if self._backup_running():
+            pref = kk.load_config().get('kapatinca', 'sor')
+            choice = pref if pref in ('arka_plan', 'kapat') else ask_close(self)
+            if choice is None:
+                return
+        self._cancel_jobs()
+        if choice == 'kapat':
+            self.full_quit()
+        else:
+            self.close_window()
+
+    def menu_full_quit(self):
+        dash, local = self._modes()
+        if not dash or local:
+            self.on_close()
+            return
+        busy = self._busy_text()
+        if busy and not messagebox.askyesno('Klip Kalkanı', f'{busy} sürüyor; kapatırsan yarıda kalır.\n\n'
+                                            'Yine de kapatılsın mı?', icon='warning', parent=self):
+            return
+        self._cancel_jobs()
+        self.full_quit()
+
+    def _busy_text(self):
+        v = self.view
+        if isinstance(v, DashboardView):
+            if v.editor is not None and getattr(v.editor, 'job_cancel', None) is not None:
+                return 'Klip kaydetme'
+            if v.restore_future and not v.restore_future.done():
+                return 'Geri yükleme'
+        if self.job is not None and not self.job.done():
+            return "Telegram işi (doğrulama / kayıtları yeniden kurma)"
+        return None
+
+    def _cancel_jobs(self):
+        v = self.view
+        if isinstance(v, DashboardView):
+            if v.editor is not None:
+                v.editor.cancel_job()
+            if v.restore_future and not v.restore_future.done():
+                v.restore_future.cancel()
+
+    @staticmethod
+    def _backup_running():
+        try:
+            return kk.uploader_alive() or bool(kk.uploader_processes())
+        except Exception:
+            return False
+
+    def _begin_close(self):
+        if not self._closing:
+            self._closing = True
+            self._close_t0 = time.time()
+
+    def full_quit(self):
+        """Pencereyi ve arka plandaki yedeklemeyi kapatır. Bu Windows oturumunda kendiliğinden açılmaz; pencere açılınca
+        ya da bilgisayar yeniden açılınca kaldığı yerden sürer. Otomatik başlatma ayarı değişmez."""
+        if self._closing:
+            return
+        self._begin_close()
+        self.withdraw()
+        self.bg(kk.quit_backup, lambda res: self.close_window(), 'pencere')
+
+    def close_window(self):
+        """Pencereyi kapatır. Güncelleme dosya yazarken ya da iptal edilen kaydetme toparlanırken (en çok 20 sn)
+        pencere gizli bekler."""
+        self._begin_close()
+        v = self.view
+        busy = self.update_busy or (isinstance(v, DashboardView) and v.editor is not None
+                                    and getattr(v.editor, 'job_cancel', None) is not None)
+        if busy and time.time() - self._close_t0 < 20:
+            self.withdraw()
+            self.after(250, self.close_window)
+            return
         self.destroy()
 
     # iş parçacıklarından arayüze güvenli çağrı
@@ -681,7 +776,10 @@ class App(tk.Tk):
         self.item(m, 'Gelişmiş ayarlar…', 'settings', self.open_advanced, 'Ctrl+,')
         m.add_separator()
         self.item(m, 'Programı kaldır…', 'delete', self.menu_uninstall)
-        self.item(m, 'Kapat', 'close', self.destroy, 'Alt+F4')
+        m.add_separator()
+        self.item(m, 'Pencereyi kapat', 'close', self.on_close, 'Alt+F4')
+        if dash and not local:
+            self.item(m, 'Tamamen kapat (yedekleme de durur)', 'power', self.menu_full_quit, 'Ctrl+Q')
 
     def _fill_backup(self, m):
         dash, local = self._modes()
@@ -1488,6 +1586,11 @@ class DashboardView(ttk.Frame):
         self._ts = (0, 'acik')
         self._tick_job = self._stats_job = None
         self._acc_loaded = self._acc_busy = False
+        self.opened = time.time()
+        self.starting = None      # arka plan başlatılıyor (ne zamandan beri)
+        self.start_msg = None     # son başlatmanın sonucu: (açıldı mı, açıklama, zaman)
+        self.auto_tried = False   # açık olması gerekirken çalışmayan arka planı bir kere kendimiz başlattık mı
+        self.stopped_at_open = kk.session_stopped()  # "tamamen kapat"tan sonra pencere açıldı: yedekleme sürsün
 
         head = ttk.Frame(self)
         head.pack(fill='x')
@@ -1660,14 +1763,32 @@ class DashboardView(ttk.Frame):
         s = kk.read_json(kk.STATUS_PATH, {}) or {}
         alive = kk.uploader_alive()
         paused_flag = bool(cfg.get('duraklat'))
-        self.pause_btn.configure(text='▶  Devam et' if paused_flag or not alive else '⏸  Duraklat')
+        self.pause_btn.configure(text='▶  Devam et' if paused_flag or not alive else '⏸  Duraklat',
+                                 state='disabled' if self.starting else 'normal')
         d = s.get('durum') if alive else None
         if not alive:
             if time.time() - self._ts[0] > 10:
                 self._ts = (time.time(), kk.task_state())
             state = self._ts[1]
-            if paused_flag:
+            stopped = kk.session_stopped()
+            age = time.time() - self.opened
+            # Yedekleme açık olmalıyken arka plan çalışmıyor (tamamen kapatılıp pencere yeniden açıldı ya da görev
+            # çalışmadı / takıldı): bir kere kendimiz başlatalım, olmazsa sebebini yazalım.
+            want = (self.stopped_at_open and age < 30) or (not stopped and age > 20)
+            if want and not (self.starting or self.auto_tried or paused_flag) and state == 'acik':
+                self.auto_tried = True
+                self.start_backup()
+            fail = self.start_msg if self.start_msg and not self.start_msg[0] else None
+            if self.starting:
+                self._set_state(GREY, 'Başlatılıyor…', 'Arka plan açılıyor; birkaç saniye sürebilir.')
+            elif paused_flag:
                 self._set_state(ORANGE, 'Duraklatıldı', 'Devam et\'e basınca kaldığı yerden sürer.')
+            elif fail:
+                self._set_state(RED, 'Arka plan açılamadı', fail[1] + '\nDevam et ile tekrar deneyebilir, Günlüğü aç '
+                                                                     'ile ayrıntıya bakabilirsin.')
+            elif stopped:
+                self._set_state(GREY, 'Kapatıldı', 'Yedekleme bu Windows oturumunda tamamen kapatıldı. Devam et\'e '
+                                                   'basınca (ya da bilgisayar yeniden açılınca) kaldığı yerden sürer.')
             elif state == 'yok':
                 self._set_state(RED, 'Arka plan kurulu değil', 'Devam et\'e basınca kurulur ve başlar.')
             elif state == 'kapali':
@@ -1694,6 +1815,25 @@ class DashboardView(ttk.Frame):
         elif d == 'giris_gerekli':
             self._set_state(RED, 'Telegram girişi gerekli', s.get('sebep') or '')
             self.relogin_btn.pack(side='right')
+            self._set_current(None, s)
+        elif d in STEP_TEXT:
+            title, sub = STEP_TEXT[d]
+            if d == 'hazirlaniyor' and s.get('dosya'):
+                sub += f' ({os.path.basename(s["dosya"])})'
+            since = time.time() - (s.get('durum_zaman') or time.time())
+            if since > 90:
+                sub += f' Bu adımda {kk.fmt_duration(since)} geçti.'
+                if d == 'baglaniyor':
+                    sub += " İnternet, güvenlik duvarı ya da antivirüs Telegram'ı engelliyor olabilir."
+            self._set_state(GREEN if d == 'hazirlaniyor' else GREY, title, sub)
+            self._set_current(None, s)
+        elif d == 'baglanti_yok':
+            self._set_state(RED, "Telegram'a bağlanılamıyor", (s.get('sebep') or '') +
+                            ' · Dakikada bir yeniden deneniyor.')
+            self._set_current(None, s)
+        elif d == 'hata':
+            self._set_state(RED, 'Bir hata oldu', (s.get('sebep') or '') + ' · Bir dakika sonra yeniden denenecek; '
+                                                                         'ayrıntı günlükte.')
             self._set_current(None, s)
         else:
             self._set_state(GREY, d or '…', s.get('sebep') or '')
@@ -1805,21 +1945,33 @@ class DashboardView(ttk.Frame):
         if cfg.get('telegramsiz'):
             self.app.connect_telegram()
             return
+        if self.starting:
+            return
         alive = kk.uploader_alive()
         if cfg.get('duraklat') or not alive:
             update_config(duraklat=False)
             if not alive:
-                self.app.bg(self._ensure_running, lambda res: None)
+                self.start_backup()
             self._ts = (0, 'acik')
         else:
             update_config(duraklat=True)
 
-    @staticmethod
-    def _ensure_running():
-        if kk.task_state() == 'yok':
-            kk.register_task()
-        else:
-            kk.start_task()
+    def start_backup(self):
+        """Arka planı başlatır ve gerçekten açıldığını bekler (takılı kalanı kapatır, görevi onarır, gerekirse
+        doğrudan başlatır); açılamazsa sebebi Durum'da yazar."""
+        self.starting = time.time()
+        self.start_msg = None
+        self.app.bg(kk.ensure_uploader, self._backup_started)
+
+    def _backup_started(self, res):
+        self.starting = None
+        ok, val = res
+        if not ok:
+            val = (False, f'Arka plan açılamadı: {friendly_error(val)}')
+        self.start_msg = (val[0], val[1], time.time())
+        self._ts = (0, 'acik')
+        if val[0] and val[1]:
+            self.app.say('⚠ ' + val[1], ORANGE, secs=30)
 
     def open_telegram(self):
         cfg = kk.load_config()
@@ -2514,6 +2666,16 @@ class AdvancedSettings(tk.Toplevel):
                 row=r + 1, column=0, columnspan=2, sticky='w', padx=(28, 0), pady=(0, 6))
         self.fields[key] = (var.get, var.set)
 
+    def choice(self, box, key, label, value, options, hint=None):
+        """Açılır listeden seçim: options = [(değer, yazı), …]"""
+        names = dict(options)
+        back = {t: v for v, t in options}
+        cb = ttk.Combobox(box, values=[t for _, t in options], state='readonly', width=34)
+        cb.set(names.get(value, options[0][1]))
+        self._row(box, label, cb, hint)
+        self.fields[key] = (lambda: back.get(cb.get(), options[0][0]),
+                            lambda v: cb.set(names.get(v, options[0][1])))
+
     def number(self, box, key, label, value, lo, hi, hint=None):
         var = tk.StringVar(value=str(value))
         self._row(box, label, ttk.Spinbox(box, from_=lo, to=hi, textvariable=var, width=8), hint)
@@ -2618,6 +2780,13 @@ class AdvancedSettings(tk.Toplevel):
                    'değişir.', as_dict=True)
 
         box = self.section('Diğer')
+        self.choice(box, 'kapatinca', 'Pencereyi kapatınca:', cfg.get('kapatinca', 'sor'),
+                    [('sor', 'Sor'), ('arka_plan', 'Yedekleme arka planda sürsün'),
+                     ('kapat', 'Tamamen kapat (yedekleme de dursun)')],
+                    'Tamamen kapatılan yedekleme pencere açılınca ya da bilgisayar yeniden açılınca kaldığı yerden sürer.')
+        self.check(box, 'tepsi_simgesi', 'Arka plan çalışırken saatin yanında simge göster',
+                   cfg.get('tepsi_simgesi', True),
+                   'Tıklayınca pencere açılır; sağ tıkta duraklat, şimdi tara ve çıkış.')
         self.check(box, 'uyku_engelle', 'Yükleme sürerken bilgisayar uykuya geçmesin (prizdeyken)',
                    cfg.get('uyku_engelle', True))
         self.check(box, 'otomatik_guncelle', 'Yeni sürümleri kendiliğinden kur', cfg.get('otomatik_guncelle', True),
@@ -2681,9 +2850,183 @@ class AdvancedSettings(tk.Toplevel):
         self.destroy()
 
 
+STEP_TEXT = {'basliyor': ('Başlıyor…', 'Arka plan açıldı, hazırlanıyor.'),
+             'baglaniyor': ("Telegram'a bağlanıyor…", 'Genelde birkaç saniye sürer.'),
+             'taraniyor': ('Klasörler taranıyor…', 'Yeni klipler aranıyor; çok dosyalı klasörlerde ilk tarama birkaç '
+                                                  'dakika sürebilir.'),
+             'hazirlaniyor': ('Klip hazırlanıyor…', 'Yüklemeden önce klibin özeti ve önizlemesi çıkarılıyor.')}
+
+
+class CloseDialog(tk.Toplevel):
+    """Pencere kapatılırken: yedekleme arka planda sürsün mü, her şey mi kapansın? "Bir daha sorma" seçilirse cevap
+    ayarlara yazılır (Gelişmiş ayarlar > Diğer'den değişir)."""
+    show = True  # denemelerde False: ekranda hiç görünmez
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.withdraw()
+        self.app = app
+        self.result = None
+        self.title('Klip Kalkanı')
+        self.transient(app)
+        self.resizable(False, False)
+        self.configure(bg=ttk.Style(self).lookup('TFrame', 'background') or '#1c1c1c')
+        if os.path.exists(ICON_PATH):
+            try:
+                self.iconbitmap(ICON_PATH)
+            except tk.TclError:
+                pass
+        s = app.ui_scale
+        body = ttk.Frame(self, padding=(22, 18))
+        body.pack(fill='both', expand=True)
+        ttk.Label(body, text='Yedekleme arka planda sürsün mü?', style='H2.TLabel').pack(anchor='w')
+        where = ('Sürerse saatin yanındaki Klip Kalkanı simgesinden istediğin an açabilir, duraklatabilir ya da '
+                 'çıkabilirsin.' if kk.load_config().get('tepsi_simgesi', True) else
+                 'Sürerse pencereyi yeniden açıp Program > Tamamen kapat ile kapatabilirsin.')
+        ttk.Label(body, text='Pencere kapanıyor. Arka planda sürerse yeni klipler kendiliğinden yüklenir (oyun '
+                             'açıkken bekler). ' + where + '\n\nTamamen kapatırsan yedekleme de durur; pencereyi '
+                             'açınca ya da bilgisayar yeniden açılınca kaldığı yerden sürer.',
+                  style='Muted.TLabel', wraplength=int(470 * s), justify='left').pack(anchor='w', pady=(6, 12))
+        self.remember = tk.BooleanVar(value=False)
+        ttk.Checkbutton(body, text="Bir daha sorma (Gelişmiş ayarlar'dan değişir)",
+                        variable=self.remember).pack(anchor='w')
+        btns = ttk.Frame(body)
+        btns.pack(fill='x', pady=(16, 0))
+        self.keep_btn = ttk.Button(btns, text='Arka planda sürsün', style='Accent.TButton',
+                                   command=lambda: self.done('arka_plan'))
+        self.keep_btn.pack(side='right')
+        ttk.Button(btns, text='Tamamen kapat', command=lambda: self.done('kapat')).pack(side='right', padx=8)
+        ttk.Button(btns, text='Vazgeç', command=lambda: self.done(None)).pack(side='left')
+        self.bind('<Escape>', lambda _e: self.done(None))
+        self.bind('<Return>', lambda _e: self.done('arka_plan'))
+        self.protocol('WM_DELETE_WINDOW', lambda: self.done(None))
+        self.update_idletasks()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        if app.state() == 'normal':
+            x = app.winfo_rootx() + (app.winfo_width() - w) // 2
+            y = app.winfo_rooty() + (app.winfo_height() - h) // 3
+        else:  # pencere simge durumunda / gizli: ekranın ortası
+            x, y = (sw - w) // 2, (sh - h) // 3
+        self.geometry(f'+{min(max(0, x), max(0, sw - w))}+{min(max(0, y), max(0, sh - h))}')
+        if self.show:
+            self.deiconify()
+            self.grab_set()
+            self.keep_btn.focus_set()
+
+    def done(self, result):
+        self.result = result
+        if result and self.remember.get():
+            update_config(kapatinca=result)
+        self.destroy()
+
+
+def ask_close(app):
+    """'arka_plan', 'kapat' ya da None (vazgeçildi)."""
+    if app.state() == 'iconic':  # görev çubuğundan kapatıldı: soru görünsün diye pencere açılır
+        app.deiconify()
+    d = CloseDialog(app)
+    app.wait_window(d)
+    return d.result
+
+
+_window_mutex = None
+WINDOW_MUTEX = 'Local\\KlipKalkaniPencere'
+
+
+def find_window():
+    """Başka bir süreçte açık duran Klip Kalkanı penceresi (Tk ana penceresi, başlığı "Klip Kalkanı …"); yoksa None.
+    Pencere başlığı mesaj gönderilmeden okunur: o pencere donmuş olsa da burada beklenmez."""
+    from ctypes import wintypes as w
+    u32 = ctypes.WinDLL('user32')
+    PROC = ctypes.WINFUNCTYPE(w.BOOL, w.HWND, w.LPARAM)
+    u32.EnumWindows.argtypes = [PROC, w.LPARAM]
+    u32.GetClassNameW.argtypes = [w.HWND, w.LPWSTR, ctypes.c_int]
+    u32.InternalGetWindowText.argtypes = [w.HWND, w.LPWSTR, ctypes.c_int]
+    u32.GetWindowThreadProcessId.argtypes = [w.HWND, ctypes.POINTER(w.DWORD)]
+    u32.IsWindowVisible.argtypes = [w.HWND]
+    found = []
+
+    def cb(hwnd, _lp):
+        buf = ctypes.create_unicode_buffer(260)
+        u32.GetClassNameW(hwnd, buf, 260)
+        if buf.value != 'TkTopLevel' or not u32.IsWindowVisible(hwnd):
+            return True
+        u32.InternalGetWindowText(hwnd, buf, 260)
+        pid = w.DWORD()
+        u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if buf.value.startswith('Klip Kalkanı ') and pid.value != os.getpid():
+            found.append(hwnd)
+            return False
+        return True
+    u32.EnumWindows(PROC(cb), 0)
+    return found[0] if found else None
+
+
+def already_open():
+    """Pencere zaten açıksa onu öne getirir ve True döner: simgeye ya da kısayola iki kere basılınca iki pencere
+    açılmasın. Güncellemeden sonra yeniden açılırken (--bekle) eski pencerenin kapanması beklenir."""
+    global _window_mutex
+    if '--bekle' in sys.argv:
+        i = sys.argv.index('--bekle')
+        try:
+            kk.psutil.Process(int(sys.argv[i + 1])).wait(20)
+        except Exception:
+            pass
+    k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    k32.CreateMutexW.restype = ctypes.c_void_p
+    k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    _window_mutex = k32.CreateMutexW(None, False, WINDOW_MUTEX)
+    if ctypes.get_last_error() != 183:  # ERROR_ALREADY_EXISTS değil: ilk pencere biziz
+        return False
+    for _ in range(12):  # öbür pencere daha yeni açılıyor olabilir
+        hwnd = find_window()
+        if hwnd:
+            return bring_to_front(hwnd)
+        time.sleep(0.25)
+    return False
+
+
+def bring_to_front(hwnd):
+    """Açık pencereyi öne getirir (simge durumundaysa açar). Pencere donmuşsa False: yenisi açılsın."""
+    from ctypes import wintypes as w
+    u32 = ctypes.WinDLL('user32')
+    for name in ('IsHungAppWindow', 'IsIconic', 'SetForegroundWindow'):
+        getattr(u32, name).argtypes = [w.HWND]
+    u32.ShowWindow.argtypes = [w.HWND, ctypes.c_int]
+    if u32.IsHungAppWindow(hwnd):
+        return False
+    u32.ShowWindow(hwnd, 9 if u32.IsIconic(hwnd) else 5)  # SW_RESTORE / SW_SHOW
+    u32.SetForegroundWindow(hwnd)
+    return True
+
+
+def hard_exit(code=0):
+    """Pencere kapandıktan sonra süreç kesin kapansın: arkada kalan bir iş parçacığı, ses çıkışı ya da video çözücü
+    yüzünden Python'un açık kalmasına (Görev Yöneticisi'nde "Python" olarak görünmesine) izin verme."""
+    for h in logging.getLogger().handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
+    for s in (sys.stdout, sys.stderr):
+        try:
+            if s is not None:
+                s.flush()
+        except Exception:
+            pass
+    os._exit(code)
+
+
 def main():
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)  # yüksek çözünürlükte bulanık olmasın
+    except Exception:
+        pass
+    if '--ac' not in sys.argv and already_open():
+        return
+    try:
+        kk.setup_logging('pencere.log', console=False)  # pencerenin yaptığı arka plan işleri (ör. başlatma) günlüğe
     except Exception:
         pass
     try:  # 1.7 öncesi kurulum: ayarlar, giriş ve kayıtlar program klasöründen %APPDATA%\KlipKalkani'ye
@@ -2702,6 +3045,7 @@ def main():
             view.nb.select(view.tabs['edit'])
             app.after(300, view.editor.open_file, sys.argv[i + 1])
     app.mainloop()
+    hard_exit()
 
 
 if __name__ == '__main__':

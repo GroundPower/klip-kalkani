@@ -17,6 +17,10 @@ Hiçbir komut bilgisayardaki klipleri silmez, taşımaz veya değiştirmez. Kana
 
 Ayarlar, Telegram girişi, veritabanı ve günlükler %APPDATA%\\KlipKalkani'de durur; program başka bir klasöre
 açılsa ya da güncellense de kaybolmaz. (1.7'den önce program klasöründeydi; ilk açılışta oraya taşınır.)
+
+Arka plan çalışırken saatin yanında simgesi durur: tıklayınca pencere açılır; sağ tıkta duraklat, şimdi tara ve
+çıkış. Çıkış (ya da penceredeki "Tamamen kapat") o Windows oturumu boyunca geçerlidir; pencere açılınca ya da bir
+sonraki Windows girişinde yedekleme yine başlar.
 """
 
 import argparse
@@ -42,11 +46,12 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 
 import psutil
 
-VERSION = '1.9'
+VERSION = '1.10'
 BASE = os.path.dirname(os.path.abspath(__file__))  # program dosyaları
 APPDATA_DIR = os.path.join(os.environ.get('APPDATA') or os.path.join(os.path.expanduser('~'), 'AppData', 'Roaming'),
                            'KlipKalkani')
@@ -57,7 +62,7 @@ DATA_PATTERNS = ('klip_kalkani*.session*', 'klip_kalkani.*.db', 'durum.json')
 def set_data_dir(d):
     """Kullanıcı verisinin (ayarlar, giriş, veritabanı, durum, günlük) durduğu klasör."""
     global DATA_DIR, CONFIG_PATH, DB_PATH, SESSION_BASE, SESSION_FILE, LOGIN_SESSION_BASE, STATUS_PATH, LOG_DIR
-    global SCAN_REQUEST
+    global SCAN_REQUEST, KAPALI_PATH
     DATA_DIR = d
     CONFIG_PATH = os.path.join(d, 'ayarlar.json')
     DB_PATH = os.path.join(d, 'klip_kalkani.db')
@@ -67,6 +72,7 @@ def set_data_dir(d):
     STATUS_PATH = os.path.join(d, 'durum.json')
     LOG_DIR = os.path.join(d, 'log')
     SCAN_REQUEST = os.path.join(d, 'tara.istek')  # pencere "şimdi tara" deyince yükleyici hemen tarar
+    KAPALI_PATH = os.path.join(d, 'kapatildi.json')  # "tamamen kapat": bu Windows oturumunda yükleyici açılmaz
 
 
 def _same(a, b):
@@ -139,6 +145,8 @@ DEFAULT_CONFIG = {
     'telegramsiz': False,         # Telegram'a bağlanmadan kullanım: düzenleyici ve özetler çalışır, yedekleme kapalı
     'otomatik_guncelle': True,    # yeni sürümler kendiliğinden kurulsun
     'ses_adlari': {},             # düzenleyicide ses kanalı adları: {orijinal ad: senin verdiğin ad}
+    'kapatinca': 'sor',           # pencere kapatılınca: 'sor', 'arka_plan' (yedekleme sürer) ya da 'kapat' (hepsi kapanır)
+    'tepsi_simgesi': True,        # arka plan çalışırken saatin yanında simge (aç / duraklat / tara / çıkış)
 }
 
 # Oyun adı olmayan, sadece kapsayıcı klasör adları (oyun adı bu klasörlerin altından okunur)
@@ -263,9 +271,16 @@ def save_config(cfg):
     write_json_atomic(CONFIG_PATH, cfg, indent=2)
 
 
+def update_config(**changes):
+    cfg = load_config()
+    cfg.update(changes)
+    save_config(cfg)
+    return cfg
+
+
 def write_json_atomic(path, data, indent=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + '.tmp'
+    tmp = f'{path}.{os.getpid()}-{threading.get_ident()}.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=indent)
     os.replace(tmp, path)
@@ -526,6 +541,21 @@ _mutex = None
 _mutex_ok = None
 
 
+def uploader_processes():
+    """Bu bilgisayarda çalışan bütün yükleyiciler (hangi klasörden ve sürümden olursa olsun), bu süreç hariç."""
+    out = []
+    for p in psutil.process_iter(['name', 'cmdline']):
+        try:
+            name = (p.info.get('name') or '').lower()
+            cmd = [a.lower() for a in (p.info.get('cmdline') or [])]
+        except psutil.Error:
+            continue
+        if (p.pid != os.getpid() and 'python' in name and 'calis' in cmd
+                and any(a.endswith('klip_kalkani.py') for a in cmd)):
+            out.append(p)
+    return out
+
+
 def single_instance():
     """Arka plan yükleyicisinden tek kopya çalışsın. Aynı süreçte tekrar çağrılınca ilk sonucu döndürür."""
     global _mutex, _mutex_ok
@@ -701,10 +731,29 @@ def channel_peer(cfg):
     return types.InputPeerChannel(int(cfg['kanal_id']), int(cfg['kanal_hash']))
 
 
+CONNECT_TIMEOUT = 180  # sn: arka plan bu kadar sürede bağlanamazsa "bağlantı yok" yazıp dakikada bir yeniden dener
+
+
+async def _connect_checked(client):
+    await client.connect()
+    return await client.is_user_authorized()
+
+
 async def connect(cfg, forever=False):
     client = make_client(cfg, forever)
-    await client.connect()
-    if not await client.is_user_authorized():
+    try:
+        if forever:  # arka plan: bağlantı sonradan koparsa kendi kendine döner ama ilk bağlantıda sonsuza kadar beklemez
+            ok = await asyncio.wait_for(_connect_checked(client), CONNECT_TIMEOUT)
+        else:
+            ok = await _connect_checked(client)
+    except (asyncio.TimeoutError, TimeoutError):
+        await client.disconnect()
+        raise ConnectionError(f"Telegram'a {CONNECT_TIMEOUT // 60} dakikada bağlanılamadı (internet, güvenlik "
+                              f"duvarı ya da antivirüs engelliyor olabilir)")
+    except BaseException:
+        await client.disconnect()
+        raise
+    if not ok:
         await client.disconnect()
         raise NotLoggedIn('Telegram oturumu kapanmış')
     return client
@@ -749,20 +798,38 @@ def build_caption(row, fp, idx, nparts, offset, length, size, sha):
 
 
 class Status:
-    """Arka plandaki işin ne yaptığını durum.json'a yazar (durum komutu okur)."""
+    """Arka plandaki işin ne yaptığını durum.json'a yazar (pencere, simge ve durum komutu okur). Ayrı bir iş parçacığı
+    yarım dakikada bir zamanı tazeler (nabız): bağlanma ya da tarama gibi uzun bir adımda da pencere yükleyicinin
+    açık olduğunu ve hangi adımda (durum_zaman'dan beri) beklediğini görür."""
 
     def __init__(self):
         self.data = {'pid': os.getpid(), 'basladi': time.time(), 'surum': VERSION}
         self.last_write = 0.0
         self.window = collections.deque()
+        self.lock = threading.Lock()
 
     def add_bytes(self, n):
-        now = time.time()
-        self.window.append((now, n))
-        while self.window and self.window[0][0] < now - 20:
-            self.window.popleft()
-        self.data['gonderilen'] = self.data.get('gonderilen', 0) + n
+        with self.lock:
+            now = time.time()
+            self.window.append((now, n))
+            while self.window and self.window[0][0] < now - 20:
+                self.window.popleft()
+            self.data['gonderilen'] = self.data.get('gonderilen', 0) + n
         self.update()
+
+    def snapshot(self):
+        with self.lock:
+            return dict(self.data)
+
+    def start_heartbeat(self, every=30):
+        def beat():
+            while True:
+                time.sleep(every)
+                try:
+                    self.update(force=True)
+                except Exception as e:  # nabız dursa da yükleme sürsün
+                    log.warning('Durum yazılamadı: %s', e)
+        threading.Thread(target=beat, daemon=True, name='nabiz').start()
 
     def speed(self):
         if len(self.window) < 2:
@@ -771,16 +838,40 @@ class Status:
         return sum(b for _, b in self.window) / span
 
     def update(self, force=False, **kw):
-        self.data.update(kw)
-        now = time.time()
-        if force or now - self.last_write >= 3:
-            self.data['hiz'] = self.speed()
-            self.data['zaman'] = now
-            try:
-                write_json_atomic(STATUS_PATH, self.data)
-            except OSError:
-                pass
-            self.last_write = now
+        with self.lock:
+            if 'durum' in kw and kw['durum'] != self.data.get('durum'):
+                self.data['durum_zaman'] = time.time()
+            self.data.update(kw)
+            now = time.time()
+            if force or now - self.last_write >= 3:
+                self.data['hiz'] = self.speed()
+                self.data['zaman'] = now
+                try:
+                    write_json_atomic(STATUS_PATH, self.data)
+                except OSError:
+                    pass
+                self.last_write = now
+
+
+STATE_TEXT = {'basliyor': 'başlıyor', 'baglaniyor': "Telegram'a bağlanıyor", 'taraniyor': 'klasörler taranıyor',
+              'hazirlaniyor': 'klip hazırlanıyor', 'yukleniyor': 'yükleniyor', 'hazir': 'her şey yedekli',
+              'duraklatildi': 'bekliyor', 'giris_gerekli': 'Telegram girişi gerekli',
+              'baglanti_yok': "Telegram'a bağlanılamıyor", 'hata': 'hata oldu, 1 dk sonra tekrar denenecek',
+              'kapatildi': 'kapatıldı', 'telegramsiz': "Telegram'sız kullanım"}
+
+
+def status_line(s):
+    """Durumun kısa Türkçe açıklaması (simgenin ipucu ve menüsü için)."""
+    d = s.get('durum')
+    if d == 'yukleniyor' and s.get('dosya'):
+        part = s.get('parca_boyut') or 0
+        total = s.get('dosya_boyut') or part
+        done = (s.get('parca_ofset') or 0) + min(part, s.get('gonderilen') or 0)
+        pct = f' %{min(100, 100 * done / total):.0f}' if total else ''
+        return f"yükleniyor{pct} · {os.path.basename(s['dosya'])}"
+    if d == 'duraklatildi':
+        return s.get('sebep') or 'bekliyor'
+    return STATE_TEXT.get(d, d or 'başlıyor')
 
 
 def _minutes(hhmm):
@@ -1044,6 +1135,7 @@ async def upload_blob(ctx, row, fp, st, deadline):
     db.commit()
     have = {r['idx'] for r in db.execute('SELECT idx FROM parts WHERE fp=?', (fp,))}
     base = os.path.basename(row['path'])
+    ctx.status.update(force=True, durum='hazirlaniyor', sebep=None, dosya=row['path'], oyun=row['game'] or 'Diğer')
     video = await asyncio.to_thread(probe_video, row['path'])
     # Tek parça ve mp4/mov ise Telegram'da oynatılan video olarak gider; parçalılar dosya + önizleme resmi.
     as_video = bool(nparts == 1 and video and video['w'] and video['h']
@@ -1378,6 +1470,8 @@ def register_task(start=True):
         raise RuntimeError((r.stderr or r.stdout).strip())
     if start:
         start_task()
+    else:
+        clear_session_stop()
 
 
 def task_state():
@@ -1393,6 +1487,7 @@ def task_state():
 
 
 def start_task():
+    clear_session_stop()
     subprocess.run(['schtasks', '/Change', '/TN', TASK_NAME, '/ENABLE'], capture_output=True,
                    creationflags=0x08000000)
     subprocess.run(['schtasks', '/Run', '/TN', TASK_NAME], capture_output=True, creationflags=0x08000000)
@@ -1400,6 +1495,7 @@ def start_task():
 
 def run_task():
     """Görevi şimdi çalıştırır (kapalıysa açmaz)."""
+    clear_session_stop()
     subprocess.run(['schtasks', '/Run', '/TN', TASK_NAME], capture_output=True, creationflags=0x08000000)
 
 
@@ -1410,21 +1506,152 @@ def remove_task():
     return r.returncode == 0
 
 
-def task_folder():
-    """Görevin çalıştırdığı program klasörü (başka klasördeki eski kurulumu bulmak için)."""
+def _task_xml():
     r = subprocess.run(['schtasks', '/Query', '/TN', TASK_NAME, '/XML'], capture_output=True, creationflags=0x08000000)
     if r.returncode != 0:
         return None
     b = r.stdout
-    text = html.unescape(b.decode('utf-16') if b[:2] in (b'\xff\xfe', b'\xfe\xff') else b.decode('mbcs', 'replace'))
-    m = re.search(r'<Arguments>[^<]*?"([^"<]+?klip_kalkani\.py)"', text, re.I)
+    return html.unescape(b.decode('utf-16') if b[:2] in (b'\xff\xfe', b'\xfe\xff') else b.decode('mbcs', 'replace'))
+
+
+def task_folder():
+    """Görevin çalıştırdığı program klasörü (başka klasördeki eski kurulumu bulmak için)."""
+    text = _task_xml()
+    m = re.search(r'<Arguments>[^<]*?"([^"<]+?klip_kalkani\.py)"', text or '', re.I)
     return os.path.dirname(m.group(1)) if m else None
+
+
+def task_problem():
+    """Görev bu klasördeki programı çalıştıramayacaksa sebebi (yoksa None): görev yok, başka klasörü gösteriyor ya
+    da gösterdiği Python/program dosyası yok (klasör taşınmış, silinmiş)."""
+    text = _task_xml()
+    if text is None:
+        return 'otomatik başlatma görevi yok'
+    cmd = re.search(r'<Command>([^<]+)</Command>', text)
+    script = re.search(r'<Arguments>[^<]*?"([^"<]+?klip_kalkani\.py)"', text, re.I)
+    if not cmd or not os.path.exists(cmd.group(1).strip().strip('"')):
+        return 'görevin çalıştırdığı Python bulunamadı'
+    if not script or not os.path.exists(script.group(1)):
+        return 'görevin çalıştırdığı program dosyası bulunamadı (klasör taşınmış ya da silinmiş olabilir)'
+    if not _same(os.path.dirname(script.group(1)), BASE):
+        return f'görev başka bir klasördeki programı çalıştırıyor ({os.path.dirname(script.group(1))})'
+    return None
+
+
+def task_last_result():
+    """Görevin son çalışmasının sonucu (0 başarılı, 0x41301 şu an çalışıyor, 0x41303 hiç çalışmadı,
+    0x80070002 dosya yok). Öğrenilemezse None."""
+    try:
+        r = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command',
+                            f"(Get-ScheduledTaskInfo -TaskName '{TASK_NAME}').LastTaskResult"],
+                           capture_output=True, text=True, creationflags=0x08000000, timeout=30)
+        return int(r.stdout.strip().splitlines()[-1]) & 0xFFFFFFFF
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+
+
+def task_result_text(code):
+    known = {0: 'son çalışması hatasız bitti', 0x41301: 'Windows\'a göre hâlâ çalışıyor',
+             0x41303: 'hiç çalışmamış', 0x41306: 'sonlandırılmış', 0x80070002: 'program dosyası bulunamadı',
+             0x80070003: 'program klasörü bulunamadı', 0x800710E0: 'Windows görevi reddetti (oturum/izin)',
+             1: 'yükleyici hatayla kapandı'}
+    if code is None:
+        return 'sonucu okunamadı'
+    return known.get(code, f'kod 0x{code:X}')
+
+
+def log_tail(n=60):
+    try:
+        with open(os.path.join(LOG_DIR, 'klip_kalkani.log'), encoding='utf-8', errors='replace') as f:
+            return f.readlines()[-n:]
+    except OSError:
+        return []
+
+
+def crash_tail(since=None):
+    """log/cokme.txt'deki son çökmenin satırları (yükleyici günlüğü kurmadan çöktüyse)."""
+    path = os.path.join(LOG_DIR, 'cokme.txt')
+    try:
+        if since and os.path.getmtime(path) < since:
+            return []
+        with open(path, encoding='utf-8', errors='replace') as f:
+            lines = [x.rstrip() for x in f.readlines()[-30:] if x.strip()]
+    except OSError:
+        return []
+    return lines
+
+
+def start_direct():
+    """Yükleyiciyi görev olmadan doğrudan başlatır (pencereden bağımsız, pencere kapanınca da sürer)."""
+    cmd = [pythonw_path(), '-E', '-s', os.path.join(BASE, 'klip_kalkani.py'), 'calis']
+    for flags in (0x08000000 | 0x01000000, 0x08000000):  # pencere yok (+ görev kutusundan/iş nesnesinden kopar)
+        try:
+            subprocess.Popen(cmd, cwd=BASE, creationflags=flags, close_fds=True)
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def _started_since(t0):
+    s = read_json(STATUS_PATH, {}) or {}
+    return uploader_alive() and s.get('basladi', 0) >= t0 - 2
+
+
+def ensure_uploader(timeout=30):
+    """Pencerenin "Devam et"i: arka planı başlatır ve gerçekten açıldığını görene kadar bekler. Takılı kalmış (durum
+    yazmayan) ya da başka klasörden kalma bir yükleyici varsa kapatır, görev bu klasörü göstermiyorsa yeniden kurar,
+    görev yine çalışmazsa yükleyiciyi doğrudan başlatır. Dönüş: (açıldı mı, açıklama ya da None)."""
+    clear_session_stop()
+    if uploader_alive():
+        return True, None
+    stuck = uploader_processes()
+
+    def young(p):
+        try:
+            return time.time() - p.create_time() < 60
+        except psutil.Error:
+            return False
+    if any(young(p) for p in stuck):  # yeni açılmış bir yükleyici var: durum yazmasını biraz bekle
+        t0 = time.time()
+        while time.time() - t0 < 20:
+            if uploader_alive():
+                return True, None
+            time.sleep(0.5)
+        stuck = uploader_processes()
+    if stuck:
+        log.warning('Cevap vermeyen %d yükleyici kapatılıyor: %s', len(stuck), [p.pid for p in stuck])
+        stop_uploader(wait=10)
+    problem = task_problem()
+    if problem:
+        log.info('Otomatik başlatma yeniden kuruluyor: %s', problem)
+        register_task(start=False)
+    t0 = time.time()
+    subprocess.run(['schtasks', '/End', '/TN', TASK_NAME], capture_output=True, creationflags=0x08000000)
+    start_task()
+    while time.time() - t0 < timeout / 2:
+        if _started_since(t0):
+            return True, None
+        time.sleep(0.5)
+    why = task_result_text(task_last_result())
+    log.warning('Görev yükleyiciyi açamadı (%s); doğrudan başlatılıyor', why)
+    if start_direct():
+        while time.time() - t0 < timeout:
+            if _started_since(t0):
+                return True, f'Windows görevi yükleyiciyi açamadı ({why}); doğrudan başlatıldı.'
+            time.sleep(0.5)
+    errs = [x.strip() for x in log_tail() if ' ERROR ' in x or 'Beklenmeyen' in x or 'Traceback' in x]
+    tail = f'\nGünlükteki son hata: {errs[-1][20:220]}' if errs else ''
+    crash = crash_tail(t0)
+    if crash and not tail:
+        tail = f'\nÇökme: {crash[-1][:200]}'
+    return False, f'Arka plan açılamadı (Windows görevi: {why}).{tail}'
 
 
 def restart_task():
     """Arka plandaki yükleyiciyi kapatıp yeniden başlatır (diskteki yeni kodla açılsın diye)."""
-    subprocess.run(['schtasks', '/End', '/TN', TASK_NAME], capture_output=True, creationflags=0x08000000)
-    subprocess.run(['schtasks', '/Run', '/TN', TASK_NAME], capture_output=True, creationflags=0x08000000)
+    stop_uploader(wait=10)
+    run_task()
 
 
 # ---------------------------------------------------------------- otomatik güncelleme (GitHub)
@@ -1525,6 +1752,391 @@ def apply_update(m):
     return m['surum']
 
 
+# ---------------------------------------------------------------- "tamamen kapat"
+
+def logon_id():
+    """Bu Windows oturumunun kimliği (oturum numarası + oturumun açıldığı an). "Tamamen kapat" bu kimlikle yazılır:
+    aynı oturumda yarım saatlik kontrol yükleyiciyi açmaz; yeni girişte (hızlı başlatmalı kapatıp açmada da) açar."""
+    from ctypes import wintypes as w
+
+    class WTSINFOW(ctypes.Structure):
+        _fields_ = [('State', ctypes.c_int), ('SessionId', w.DWORD), ('IncomingBytes', w.DWORD),
+                    ('OutgoingBytes', w.DWORD), ('IncomingFrames', w.DWORD), ('OutgoingFrames', w.DWORD),
+                    ('IncomingCompressedBytes', w.DWORD), ('OutgoingCompressedBytes', w.DWORD),
+                    ('WinStationName', w.WCHAR * 32), ('Domain', w.WCHAR * 17), ('UserName', w.WCHAR * 21),
+                    ('ConnectTime', ctypes.c_longlong), ('DisconnectTime', ctypes.c_longlong),
+                    ('LastInputTime', ctypes.c_longlong), ('LogonTime', ctypes.c_longlong),
+                    ('CurrentTime', ctypes.c_longlong)]
+    try:
+        k32 = ctypes.WinDLL('kernel32')
+        wts = ctypes.WinDLL('wtsapi32')
+        k32.ProcessIdToSessionId.argtypes = [w.DWORD, ctypes.POINTER(w.DWORD)]
+        wts.WTSQuerySessionInformationW.argtypes = [w.HANDLE, w.DWORD, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p),
+                                                    ctypes.POINTER(w.DWORD)]
+        wts.WTSFreeMemory.argtypes = [ctypes.c_void_p]
+        sid, buf, n = w.DWORD(), ctypes.c_void_p(), w.DWORD()
+        if (k32.ProcessIdToSessionId(os.getpid(), ctypes.byref(sid))
+                and wts.WTSQuerySessionInformationW(None, sid.value, 24, ctypes.byref(buf), ctypes.byref(n))):
+            try:
+                if n.value >= ctypes.sizeof(WTSINFOW):
+                    logon = ctypes.cast(buf, ctypes.POINTER(WTSINFOW)).contents.LogonTime
+                    if logon:
+                        return f'{sid.value}:{logon}'
+            finally:
+                wts.WTSFreeMemory(buf)
+    except Exception:
+        pass
+    return f'acilis:{int(psutil.boot_time())}'
+
+
+def mark_session_stop(why):
+    write_json_atomic(KAPALI_PATH, {'oturum': logon_id(), 'zaman': time.time(), 'neden': why})
+
+
+def clear_session_stop():
+    try:
+        os.remove(KAPALI_PATH)
+    except OSError:
+        pass
+
+
+def session_stopped():
+    """Bu Windows oturumunda "tamamen kapat" denmişse True. Yeni oturumda işaret kendiliğinden kalkar."""
+    d = read_json(KAPALI_PATH)
+    if not d:
+        return False
+    if d.get('oturum') == logon_id():
+        return True
+    clear_session_stop()
+    return False
+
+
+# ---------------------------------------------------------------- saatin yanındaki simge
+
+TRAY_CLASS = 'KlipKalkaniSimge'
+_tray = None
+_tray_api = None
+_tray_windows = {}  # pencere tutamacı → Tray
+
+
+def open_window(*args):
+    """Klip Kalkanı penceresini açar (zaten açıksa pencere kendisi öne gelir). Görevin iş nesnesinden kopar:
+    yükleyici kapanınca pencere de kapanmasın."""
+    exe = os.path.join(BASE, 'Klip Kalkanı.exe')
+    cmd = [exe, *args] if os.path.exists(exe) else [pythonw_path(), '-E', '-s', os.path.join(BASE, 'arayuz.pyw'), *args]
+    try:
+        ctypes.windll.user32.AllowSetForegroundWindow(-1)  # açılan pencere öne gelebilsin (ASFW_ANY)
+    except Exception:
+        pass
+    for flags in (0x01000000, 0):  # CREATE_BREAKAWAY_FROM_JOB
+        try:
+            subprocess.Popen(cmd, cwd=BASE, creationflags=flags, close_fds=True)
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def _post_to_tray(msg):
+    """Çalışan yükleyicinin simgesine mesaj gönderir (ör. kapan). Simge yoksa False."""
+    try:
+        u32 = ctypes.WinDLL('user32')
+        u32.FindWindowW.restype = ctypes.c_void_p
+        u32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+        u32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+        hwnd = u32.FindWindowW(TRAY_CLASS, None)
+        return bool(hwnd) and bool(u32.PostMessageW(hwnd, msg, 0, 0))
+    except Exception:
+        return False
+
+
+def _win32():
+    """Simge için Windows işlevleri (bir kere hazırlanır)."""
+    global _tray_api
+    if _tray_api is not None:
+        return _tray_api
+    from ctypes import wintypes as w
+    P = ctypes.POINTER
+    LRESULT = w.LPARAM
+    WNDPROC = ctypes.WINFUNCTYPE(LRESULT, w.HWND, w.UINT, w.WPARAM, w.LPARAM)
+
+    class WNDCLASSEXW(ctypes.Structure):
+        _fields_ = [('cbSize', w.UINT), ('style', w.UINT), ('lpfnWndProc', WNDPROC), ('cbClsExtra', ctypes.c_int),
+                    ('cbWndExtra', ctypes.c_int), ('hInstance', w.HINSTANCE), ('hIcon', w.HICON),
+                    ('hCursor', w.HANDLE), ('hbrBackground', w.HBRUSH), ('lpszMenuName', w.LPCWSTR),
+                    ('lpszClassName', w.LPCWSTR), ('hIconSm', w.HICON)]
+
+    class NOTIFYICONDATAW(ctypes.Structure):
+        _fields_ = [('cbSize', w.DWORD), ('hWnd', w.HWND), ('uID', w.UINT), ('uFlags', w.UINT),
+                    ('uCallbackMessage', w.UINT), ('hIcon', w.HICON), ('szTip', w.WCHAR * 128),
+                    ('dwState', w.DWORD), ('dwStateMask', w.DWORD), ('szInfo', w.WCHAR * 256),
+                    ('uVersion', w.UINT), ('szInfoTitle', w.WCHAR * 64), ('dwInfoFlags', w.DWORD),
+                    ('guidItem', ctypes.c_byte * 16), ('hBalloonIcon', w.HICON)]
+
+    u32 = ctypes.WinDLL('user32', use_last_error=True)
+    sh = ctypes.WinDLL('shell32', use_last_error=True)
+    k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    for dll, name, res, args in (
+            (u32, 'RegisterClassExW', w.ATOM, [P(WNDCLASSEXW)]),
+            (u32, 'CreateWindowExW', w.HWND, [w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD, ctypes.c_int, ctypes.c_int,
+                                              ctypes.c_int, ctypes.c_int, w.HWND, w.HMENU, w.HINSTANCE, w.LPVOID]),
+            (u32, 'DefWindowProcW', LRESULT, [w.HWND, w.UINT, w.WPARAM, w.LPARAM]),
+            (u32, 'GetMessageW', w.BOOL, [P(w.MSG), w.HWND, w.UINT, w.UINT]),
+            (u32, 'TranslateMessage', w.BOOL, [P(w.MSG)]),
+            (u32, 'DispatchMessageW', LRESULT, [P(w.MSG)]),
+            (u32, 'PostMessageW', w.BOOL, [w.HWND, w.UINT, w.WPARAM, w.LPARAM]),
+            (u32, 'PostQuitMessage', None, [ctypes.c_int]),
+            (u32, 'DestroyWindow', w.BOOL, [w.HWND]),
+            (u32, 'RegisterWindowMessageW', w.UINT, [w.LPCWSTR]),
+            (u32, 'CreatePopupMenu', w.HMENU, []),
+            (u32, 'AppendMenuW', w.BOOL, [w.HMENU, w.UINT, ctypes.c_size_t, w.LPCWSTR]),
+            (u32, 'SetMenuDefaultItem', w.BOOL, [w.HMENU, w.UINT, w.UINT]),
+            (u32, 'TrackPopupMenu', w.BOOL, [w.HMENU, w.UINT, ctypes.c_int, ctypes.c_int, ctypes.c_int, w.HWND,
+                                             ctypes.c_void_p]),
+            (u32, 'DestroyMenu', w.BOOL, [w.HMENU]),
+            (u32, 'GetCursorPos', w.BOOL, [P(w.POINT)]),
+            (u32, 'SetForegroundWindow', w.BOOL, [w.HWND]),
+            (u32, 'SetTimer', ctypes.c_size_t, [w.HWND, ctypes.c_size_t, w.UINT, ctypes.c_void_p]),
+            (u32, 'LoadImageW', w.HANDLE, [w.HINSTANCE, w.LPCWSTR, w.UINT, ctypes.c_int, ctypes.c_int, w.UINT]),
+            (u32, 'LoadIconW', w.HICON, [w.HINSTANCE, ctypes.c_void_p]),
+            (u32, 'GetSystemMetrics', ctypes.c_int, [ctypes.c_int]),
+            (sh, 'Shell_NotifyIconW', w.BOOL, [w.DWORD, P(NOTIFYICONDATAW)]),
+            (k32, 'GetModuleHandleW', w.HMODULE, [w.LPCWSTR])):
+        f = getattr(dll, name)
+        f.restype, f.argtypes = res, args
+
+    def wndproc(hwnd, msg, wp, lp):
+        t = _tray_windows.get(hwnd)
+        if t is not None:
+            try:
+                r = t.handle(msg, wp, lp)
+                if r is not None:
+                    return r
+            except Exception as e:  # simge hatası yedeklemeyi durdurmasın
+                log.warning('Simge: %s', e)
+        return u32.DefWindowProcW(hwnd, msg, wp, lp)
+
+    api = type('Win32', (), {})()
+    api.w, api.u32, api.sh, api.k32 = w, u32, sh, k32
+    api.WNDCLASSEXW, api.NOTIFYICONDATAW = WNDCLASSEXW, NOTIFYICONDATAW
+    api.proc = WNDPROC(wndproc)  # çöpe gitmesin
+    _tray_api = api
+    return api
+
+
+class Tray:
+    """Arka plan çalışırken saatin yanındaki simge: yedeklemenin açık olduğunu ve ne yaptığını gösterir. Tıklayınca
+    pencere açılır; sağ tıkta durum, duraklat/devam, şimdi tara ve çıkış. Kendi iş parçacığında Windows mesaj
+    döngüsüyle çalışır; bir sorun çıkarsa simge görünmez ama yedekleme etkilenmez."""
+
+    WM_TRAY = 0x8000 + 1       # WM_APP + 1: simgeye tıklandı
+    WM_QUIT_APP = 0x8000 + 2   # pencere yükleyicinin kapanmasını istiyor (simgeyi kaldırıp çıkar)
+    OPEN, PAUSE, SCAN, QUIT = 1, 2, 3, 4
+
+    def __init__(self, status, cls=TRAY_CLASS, hidden=False):
+        self.status = status
+        self.cls = cls
+        self.hidden = hidden      # deneme için: simge eklenir ama görünmez (NIS_HIDDEN)
+        self.hwnd = None
+        self.shown = False
+        self.tip = None
+        self.icon = None
+        self.msg_taskbar = None
+        self.last_open = 0.0
+        self.ready = threading.Event()
+        self.exit = lambda: os._exit(0)
+        self.track = None         # deneme için: menü gösterilmeden seçilecek komut
+
+    def run(self):
+        try:
+            self._loop()
+        except Exception as e:
+            log.warning('Saatin yanındaki simge gösterilemedi: %s', e)
+        finally:
+            self.ready.set()
+
+    def _loop(self):
+        api = _win32()
+        u = api.u32
+        try:  # simge ekran ölçeğine göre keskin olsun
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            pass
+        hinst = api.k32.GetModuleHandleW(None)
+        wc = api.WNDCLASSEXW()
+        wc.cbSize = ctypes.sizeof(wc)
+        wc.lpfnWndProc = api.proc
+        wc.hInstance = hinst
+        wc.lpszClassName = self.cls
+        if not u.RegisterClassExW(ctypes.byref(wc)) and ctypes.get_last_error() != 1410:  # 1410: zaten kayıtlı
+            raise ctypes.WinError(ctypes.get_last_error())
+        self.hwnd = u.CreateWindowExW(0, self.cls, 'Klip Kalkanı', 0, 0, 0, 0, 0, None, None, hinst, None)
+        if not self.hwnd:
+            raise ctypes.WinError(ctypes.get_last_error())
+        _tray_windows[self.hwnd] = self
+        self.msg_taskbar = u.RegisterWindowMessageW('TaskbarCreated')
+        cx, cy = u.GetSystemMetrics(49), u.GetSystemMetrics(50)  # küçük simge boyu
+        ico = os.path.join(BASE, 'kalkan.ico')
+        self.icon = (u.LoadImageW(None, ico, 1, cx, cy, 0x10) if os.path.exists(ico) else None) \
+            or u.LoadIconW(None, ctypes.c_void_p(32512))
+        self.refresh()
+        u.SetTimer(self.hwnd, 1, 5000, None)
+        self.ready.set()
+        msg = api.w.MSG()
+        while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            u.TranslateMessage(ctypes.byref(msg))
+            u.DispatchMessageW(ctypes.byref(msg))
+        _tray_windows.pop(self.hwnd, None)
+
+    def handle(self, msg, wp, lp):
+        if msg == self.WM_TRAY:
+            ev = lp & 0xFFFF
+            if ev in (0x0202, 0x0400):      # sol tık (WM_LBUTTONUP, NIN_SELECT): pencereyi aç
+                self.open()
+            elif ev in (0x0205, 0x007B):    # sağ tık (WM_RBUTTONUP, WM_CONTEXTMENU): menü
+                self.menu()
+            return 0
+        if msg == 0x0113:                   # WM_TIMER: ipucunu ve görünürlüğü tazele
+            self.refresh()
+            return 0
+        if msg == self.WM_QUIT_APP:
+            log.info('Pencere yükleyicinin kapanmasını istedi')
+            self.quit()
+            return 0
+        if msg == 0x0002:                   # WM_DESTROY
+            self.remove()
+            _win32().u32.PostQuitMessage(0)
+            return 0
+        if self.msg_taskbar and msg == self.msg_taskbar:  # Explorer yeniden başladı: simgeyi yeniden ekle
+            self.shown = False
+            self.refresh()
+            return 0
+        return None
+
+    def _nid(self, flags, tip=None):
+        api = _win32()
+        nid = api.NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(nid)
+        nid.hWnd = self.hwnd
+        nid.uID = 1
+        nid.uFlags = flags
+        nid.uCallbackMessage = self.WM_TRAY
+        nid.hIcon = self.icon
+        if tip is not None:
+            nid.szTip = tip[:127]
+        if self.hidden:
+            nid.uFlags |= 0x8               # NIF_STATE
+            nid.dwState = nid.dwStateMask = 0x1  # NIS_HIDDEN
+        return nid
+
+    def status_text(self):
+        s = self.status.snapshot()
+        if load_config().get('duraklat') and s.get('durum') in (None, 'hazir', 'yukleniyor', 'duraklatildi'):
+            return 'Klip Kalkanı · duraklatıldı'
+        return ('Klip Kalkanı · ' + status_line(s))[:127]
+
+    def refresh(self):
+        sh = _win32().sh
+        if not load_config().get('tepsi_simgesi', True):
+            self.remove()
+            return
+        tip = self.status_text()
+        if not self.shown:
+            nid = self._nid(0x1 | 0x2 | 0x4, tip)  # NIF_MESSAGE | NIF_ICON | NIF_TIP
+            # Explorer henüz hazır değilse (Windows yeni açıldı) sonraki zamanlayıcıda yine denenir
+            if sh.Shell_NotifyIconW(0, ctypes.byref(nid)) or sh.Shell_NotifyIconW(1, ctypes.byref(nid)):
+                self.shown, self.tip = True, tip
+        elif tip != self.tip:
+            if sh.Shell_NotifyIconW(1, ctypes.byref(self._nid(0x4, tip))):
+                self.tip = tip
+            else:
+                self.shown = False
+
+    def remove(self):
+        if self.shown:
+            _win32().sh.Shell_NotifyIconW(2, ctypes.byref(self._nid(0)))  # NIM_DELETE
+            self.shown = False
+
+    def open(self):
+        if time.time() - self.last_open < 3:  # çift tıklamada iki kere açılmasın
+            return
+        self.last_open = time.time()
+        open_window()
+
+    def menu(self):
+        api = _win32()
+        u = api.u32
+        paused = bool(load_config().get('duraklat'))
+        m = u.CreatePopupMenu()
+        try:
+            u.AppendMenuW(m, 0x1, 0, self.status_text())   # MF_GRAYED: sadece bilgi
+            u.AppendMenuW(m, 0x800, 0, None)               # ayraç
+            u.AppendMenuW(m, 0, self.OPEN, "Klip Kalkanı'nı aç")
+            u.SetMenuDefaultItem(m, self.OPEN, 0)
+            u.AppendMenuW(m, 0, self.PAUSE, 'Yedeklemeye devam et' if paused else 'Yedeklemeyi duraklat')
+            u.AppendMenuW(m, 0, self.SCAN, 'Klasörleri şimdi tara')
+            u.AppendMenuW(m, 0x800, 0, None)
+            u.AppendMenuW(m, 0, self.QUIT, 'Çıkış (yedekleme durur)')
+            if self.track is not None:
+                cmd = self.track
+            else:
+                pt = api.w.POINT()
+                u.GetCursorPos(ctypes.byref(pt))
+                u.SetForegroundWindow(self.hwnd)  # menü dışına tıklanınca kapansın diye
+                cmd = u.TrackPopupMenu(m, 0x0100 | 0x0080 | 0x0002, pt.x, pt.y, 0, self.hwnd, None)
+                u.PostMessageW(self.hwnd, 0, 0, 0)
+        finally:
+            u.DestroyMenu(m)
+        self.command(cmd)
+
+    def command(self, cmd):
+        if cmd == self.OPEN:
+            self.open()
+        elif cmd == self.PAUSE:
+            paused = bool(load_config().get('duraklat'))
+            update_config(duraklat=not paused)
+            log.info('Simgeden %s', 'devam edildi' if paused else 'duraklatıldı')
+            self.refresh()
+        elif cmd == self.SCAN:
+            request_scan()
+        elif cmd == self.QUIT:
+            mark_session_stop('simge')
+            log.info('Simgeden çıkıldı; bu Windows oturumunda kendiliğinden açılmaz')
+            self.quit()
+
+    def quit(self):
+        self.remove()
+        try:
+            self.status.update(force=True, durum='kapatildi', sebep=None)
+        except Exception:
+            pass
+        for h in logging.getLogger().handlers:
+            try:
+                h.flush()
+            except Exception:
+                pass
+        self.exit()
+
+
+def start_tray(status):
+    global _tray
+    try:
+        _tray = Tray(status)
+        threading.Thread(target=_tray.run, daemon=True, name='simge').start()
+        import atexit
+        atexit.register(remove_tray)
+    except Exception as e:
+        log.warning('Saatin yanındaki simge başlatılamadı: %s', e)
+
+
+def remove_tray():
+    if _tray is not None:
+        try:
+            _tray.remove()
+        except Exception:
+            pass
+
+
 def restart_uploader():
     """Güncellemeden sonra arka plandaki yükleyiciyi yeni kodla yeniden başlatır."""
     cmd = f'cmd /c ping -n 6 127.0.0.1 >nul & schtasks /Run /TN "{TASK_NAME}"'
@@ -1534,6 +2146,7 @@ def restart_uploader():
             break
         except OSError:
             continue
+    remove_tray()
     os._exit(0)
 
 
@@ -1549,19 +2162,37 @@ def uploader_alive(status_path=None):
 
 
 def stop_uploader(wait=20, status_path=None):
-    """Arka plandaki yükleyiciyi kapatır. Görev açık kalırsa yarım saatlik kontrolde yine başlar;
-    tamamen durması için disable_task() da gerekir."""
+    """Arka plandaki yükleyiciyi kapatır: önce simgesine kapanmasını söyler (simge de kaybolur), kapanmazsa zorla;
+    takılı kalmış başka kopyalar da kapanır. Görev açık kalırsa yarım saatlik kontrolde yine başlar; tamamen durması
+    için disable_task() ya da quit_backup() gerekir."""
+    if _post_to_tray(Tray.WM_QUIT_APP):
+        deadline = time.time() + 5
+        while time.time() < deadline and uploader_processes():
+            time.sleep(0.2)
     subprocess.run(['schtasks', '/End', '/TN', TASK_NAME], capture_output=True, creationflags=0x08000000)
+    procs = uploader_processes()
     pid = (read_json(status_path or STATUS_PATH, {}) or {}).get('pid')
-    if not pid:
-        return
-    try:
-        p = psutil.Process(pid)
-        if 'python' in p.name().lower() and any('klip_kalkani' in a.lower() for a in p.cmdline()):
+    if pid and pid != os.getpid() and pid not in {p.pid for p in procs}:
+        try:
+            p = psutil.Process(pid)
+            if 'python' in p.name().lower() and any('klip_kalkani' in a.lower() for a in p.cmdline()):
+                procs.append(p)
+        except psutil.Error:
+            pass
+    for p in procs:
+        try:
             p.terminate()
-            p.wait(wait)
-    except psutil.Error:
-        pass
+        except psutil.Error:
+            pass
+    psutil.wait_procs(procs, timeout=wait)
+
+
+def quit_backup(why='pencere'):
+    """"Tamamen kapat": yükleyiciyi kapatır; bu Windows oturumunda kendiliğinden açılmaz (pencere açılınca ya da bir
+    sonraki girişte yine başlar). Otomatik başlatma ayarı değişmez."""
+    mark_session_stop(why)
+    stop_uploader(wait=10)
+    log.info('Tamamen kapatıldı (%s)', why)
 
 
 def disable_task():
@@ -1873,18 +2504,23 @@ async def cmd_run(cfg, limit=None):
     if not single_instance():
         log.info('Zaten çalışıyor, ikinci kopya açılmadı.')
         return
-    db = open_db()
     status = Status()
+    status.update(force=True, durum='basliyor', sebep=None)
+    status.start_heartbeat()
+    db = open_db()
     started = time.time()
-    log.info('Klip Kalkanı %s başladı', VERSION)
+    log.info('Klip Kalkanı %s başladı (pid %d, %s)', VERSION, os.getpid(), BASE)
     if load_config().get('telegramsiz'):
         log.info("Telegram'sız kullanım seçili: yedekleme kapalı, yükleyici çalışmıyor")
         status.update(force=True, durum='telegramsiz', sebep=None)
         return
+    if not limit:
+        start_tray(status)
     if not meta_get(db, 'kurulum'):
         meta_set(db, 'kurulum', time.time())
     while True:
         cfg = load_config()
+        status.update(force=True, durum='baglaniyor', sebep=None)
         try:
             client = await connect(cfg, forever=True)
         except NotLoggedIn as e:
@@ -1938,6 +2574,8 @@ async def upload_loop(client, cfg, db, status, limit, started):
             next_scan = 0.0
         if now >= next_scan:
             ctx.gate.reload_if_changed()  # klasör listesi arayüzden değişmiş olabilir
+            if status.data.get('durum') in (None, 'basliyor', 'baglaniyor', 'hazir'):
+                status.update(force=True, durum='taraniyor', sebep=None)
             st = await asyncio.to_thread(scan, cfg)
             queue = build_queue(db, cfg, st['start'])
             next_scan = time.time() + cfg['tarama_dakika'] * 60
@@ -2357,7 +2995,19 @@ def main():
     args = ap.parse_args()
 
     if args.komut == 'calis':
+        if sys.stderr is None:  # pythonw: günlük kurulmadan çökerse izi kaybolmasın (pencere teşhiste gösterir)
+            try:
+                os.makedirs(LOG_DIR, exist_ok=True)
+                sys.stderr = open(os.path.join(LOG_DIR, 'cokme.txt'), 'a', encoding='utf-8', buffering=1)
+            except OSError:
+                pass
+        if session_stopped():
+            return  # "tamamen kapat" denmiş: bu Windows oturumunda açılmaz (pencere açılınca ya da yeni girişte açılır)
         if not single_instance():
+            if not uploader_alive():  # öbürü durum yazmıyor: takılmış olabilir, pencerede görünsün diye günlüğe
+                setup_logging('klip_kalkani.log', console=False)
+                log.warning('Başka bir yükleyici çalışıyor ama durum yazmıyor (takılmış olabilir): %s',
+                            [p.pid for p in uploader_processes()])
             return  # arka planda zaten bir yükleyici var
         try:
             migrate_data()  # 1.7 öncesi kurulum: veriler program klasöründen %APPDATA%'ya

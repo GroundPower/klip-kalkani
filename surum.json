@@ -1,11 +1,11 @@
 {
-  "surum": "1.9",
-  "etiket": "v1.9",
+  "surum": "1.10",
+  "etiket": "v1.10",
   "tarih": "2026-09-29",
-  "notlar": "Koyu, ikonlu menü ve kısayol tuşları; sağ üstte Gelişmiş ayarlar (bütün ayarlar tek yerde, hız saatleri dahil); Telegram'sız kullanım (Telegram olmadan devam et); düzenleyicide ses kanalı adları değiştirilebilir (hatırlanır, dosyaya yazılır).",
+  "notlar": "Saatin yanında simge (aç, duraklat, tara, çıkış); pencere kapatılırken yedekleme arka planda sürsün mü diye sorar, Tamamen kapat; pencere kapanınca arkada Python kalmaz; Devam et arka planı gerçekten başlatır, takılırsa sebebini yazar; tek pencere.",
   "dosyalar": {
-    "klip_kalkani.py": "06d30fb1e80fd9c4a75ecd4c399d146046a9e265d312c1d5143a23dbab9b7ae6",
-    "arayuz.pyw": "63a03b10f8cd9f21d116071706f02817e55dfa28c04dd2b60a7826960035183e",
+    "klip_kalkani.py": "fe2a4a0911e1511f03e14e6308fe47388151d2ae54aa3e0a95da35807c668506",
+    "arayuz.pyw": "029f88a3191ea84e33dc6ff4b50bd139c20fe8eeb097d9e809cba14b284f4347",
     "duzenle.py": "bb59edfc4d871a6343a2025a7c34fa0d5a6bd328a06224d68c187896da4d69b9",
     "kalkan.ico": "e6190e96224a6adf554c9811b09a956be68943c4d48433d8e4435aeaee971504",
     "Klip Kalkanı.exe": "6e3b66fa809f7c58a09e41ce067c424995258ed1a7c4a7fe33f2b1925fc6d202"
