@@ -46,11 +46,17 @@ NE YAPAR
 - Hiçbir dosyayı silmez, taşımaz. Aynı klip iki kere yüklenmez.
 
 MENÜ (pencerenin üstünde)
-- Program: duraklat/devam, "Windows açılınca otomatik başlat" (aç/kapat), masaüstü ve Başlat menüsü kısayolu,
-  program / ayar klasörü, günlük, "Programı kaldır".
-- Yedek: klasörleri şimdi tara, Telegram'daki yedekleri doğrula, kayıtları Telegram'dan yeniden kur,
-  arşiv grubunu Telegram'da aç.
-- Hesap: hangi Telegram hesabı, çıkış yap.   Yardım: güncellemeleri kontrol et, sürüm notları, hakkında.
+- Program: duraklat/devam (Ctrl+D), "Windows açılınca otomatik başlat" (aç/kapat), masaüstü ve Başlat menüsü
+  kısayolu, program / ayar klasörü, günlük, "Programı kaldır".
+- Yedek: klasörleri şimdi tara (F5), Telegram'daki yedekleri doğrula, kayıtları Telegram'dan yeniden kur,
+  arşiv grubunu Telegram'da aç, geri yükle, düzenle.
+- Hesap: hangi Telegram hesabı, çıkış yap / Telegram'a bağlan.   Yardım: güncellemeler (Ctrl+U), yardım (F1).
+- Sağ üstte "Gelişmiş ayarlar" (Ctrl+,): bütün ayarlar tek yerde (hız saatleri, oyun listesi, tarama,
+  uzantılar, oyun adları, ses kanalı adları, otomatik güncelleme…).
+
+TELEGRAM'SIZ KULLANIM
+- Kurulumda ya da giriş ekranında "Telegram olmadan devam et": düzenleyici, klasörler ve oyun özetleri
+  çalışır, yedekleme kapalı kalır. Sonra istersen Hesap > "Telegram'a bağlan".
 
 AYARLAR NEREDE?
 - Ayarlar, Telegram girişi ve yedek kayıtları %APPDATA%\\KlipKalkani klasöründe durur (Program > Ayar klasörünü aç).

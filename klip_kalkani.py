@@ -46,7 +46,7 @@ import time
 
 import psutil
 
-VERSION = '1.8'
+VERSION = '1.9'
 BASE = os.path.dirname(os.path.abspath(__file__))  # program dosyaları
 APPDATA_DIR = os.path.join(os.environ.get('APPDATA') or os.path.join(os.path.expanduser('~'), 'AppData', 'Roaming'),
                            'KlipKalkani')
@@ -136,6 +136,9 @@ DEFAULT_CONFIG = {
     # Oyun adı sanılmaması gereken ek klasör adları (ör. kendi yedek klasörlerin) ve ek oyun adı düzeltmeleri
     'genel_klasorler': [],
     'oyun_takma_adlari': {},
+    'telegramsiz': False,         # Telegram'a bağlanmadan kullanım: düzenleyici ve özetler çalışır, yedekleme kapalı
+    'otomatik_guncelle': True,    # yeni sürümler kendiliğinden kurulsun
+    'ses_adlari': {},             # düzenleyicide ses kanalı adları: {orijinal ad: senin verdiğin ad}
 }
 
 # Oyun adı olmayan, sadece kapsayıcı klasör adları (oyun adı bu klasörlerin altından okunur)
@@ -833,7 +836,8 @@ class Gate:
             return
         for key in ('hiz_plani', 'max_hiz_mbit', 'oyunda_dur', 'tam_ekranda_dur', 'oyun_exe',
                     'oyun_kapaninca_bekle_sn', 'uyku_engelle', 'paralel_parca', 'duraklat',
-                    'kaynaklar', 'yeni_klip_gun', 'tarama_dakika', 'uzantilar'):
+                    'kaynaklar', 'yeni_klip_gun', 'tarama_dakika', 'uzantilar', 'genel_klasorler',
+                    'oyun_takma_adlari', 'oyun_konulari', 'otomatik_guncelle', 'kanal_adi'):
             self.cfg[key] = new.get(key)
         self.names = {n.lower() for n in self.cfg.get('oyun_exe') or []}
         log.info('Ayarlar değişti, yeniden yüklendi')
@@ -1873,6 +1877,10 @@ async def cmd_run(cfg, limit=None):
     status = Status()
     started = time.time()
     log.info('Klip Kalkanı %s başladı', VERSION)
+    if load_config().get('telegramsiz'):
+        log.info("Telegram'sız kullanım seçili: yedekleme kapalı, yükleyici çalışmıyor")
+        status.update(force=True, durum='telegramsiz', sebep=None)
+        return
     if not meta_get(db, 'kurulum'):
         meta_set(db, 'kurulum', time.time())
     while True:
@@ -1946,7 +1954,7 @@ async def upload_loop(client, cfg, db, status, limit, started):
         if now >= (meta_get(db, 'son_dogrulama') or 0) + 7 * 86400 and db.execute(
                 'SELECT 1 FROM parts LIMIT 1').fetchone():
             await verify(ctx)
-        if now >= ctx.next_update_check:
+        if now >= ctx.next_update_check and cfg.get('otomatik_guncelle', True):
             ctx.next_update_check = now + 6 * 3600
             try:
                 m = await asyncio.to_thread(check_update)

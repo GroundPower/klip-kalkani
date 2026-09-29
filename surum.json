@@ -1,12 +1,12 @@
 {
-  "surum": "1.8",
-  "etiket": "v1.8",
+  "surum": "1.9",
+  "etiket": "v1.9",
   "tarih": "2026-09-29",
-  "notlar": "Düzenle: ses kanalları (tüm ses / oyun / Discord / mikrofon) için aç/kapat, seviye %0–200, tek dinle ve seviye göstergesi; kaydederken tek kanal karışım ya da ayrı kanallar.",
+  "notlar": "Koyu, ikonlu menü ve kısayol tuşları; sağ üstte Gelişmiş ayarlar (bütün ayarlar tek yerde, hız saatleri dahil); Telegram'sız kullanım (Telegram olmadan devam et); düzenleyicide ses kanalı adları değiştirilebilir (hatırlanır, dosyaya yazılır).",
   "dosyalar": {
-    "klip_kalkani.py": "420d20d067cef690d439c96b83ca7ae29935e91171a78de0c606a120c88a9189",
-    "arayuz.pyw": "cfb55c47bb97a962c5913f835ec8b09d60b77a426ab70ace24ecf32df4a9bb7b",
-    "duzenle.py": "de87a3ab4407eb4eef38e4e1a3f5877bee06b4278d76ee5919b9ccf51fc5eae1",
+    "klip_kalkani.py": "06d30fb1e80fd9c4a75ecd4c399d146046a9e265d312c1d5143a23dbab9b7ae6",
+    "arayuz.pyw": "63a03b10f8cd9f21d116071706f02817e55dfa28c04dd2b60a7826960035183e",
+    "duzenle.py": "bb59edfc4d871a6343a2025a7c34fa0d5a6bd328a06224d68c187896da4d69b9",
     "kalkan.ico": "e6190e96224a6adf554c9811b09a956be68943c4d48433d8e4435aeaee971504",
     "Klip Kalkanı.exe": "6e3b66fa809f7c58a09e41ce067c424995258ed1a7c4a7fe33f2b1925fc6d202"
   },

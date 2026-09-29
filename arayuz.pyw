@@ -25,6 +25,8 @@ import urllib.error
 import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
+from PIL import Image, ImageDraw, ImageFont, ImageTk
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 import klip_kalkani as kk  # noqa: E402
@@ -69,22 +71,38 @@ def choice_to_mbit(s):
 
 
 def plan_values(cfg):
-    """(gündüz, gece) Mbit."""
-    if not cfg.get('hiz_plani'):
+    """(gündüz, gece) Mbit. Plan [gece, gündüz] sırasıyla durur."""
+    plan = cfg.get('hiz_plani') or []
+    if len(plan) < 2:
         m = cfg.get('max_hiz_mbit') or 0
         return (m if m > 0 else UNLIMITED), (m if m > 0 else UNLIMITED)
-    day, night = 8, 20
-    for p in cfg['hiz_plani']:
-        if p.get('baslangic') == '01:00':
-            night = p.get('mbit', night)
-        elif p.get('baslangic') == '09:00':
-            day = p.get('mbit', day)
-    return day, night
+    return plan[1].get('mbit', 8), plan[0].get('mbit', 20)
 
 
-def make_plan(day, night):
-    return [{'baslangic': '01:00', 'bitis': '09:00', 'mbit': night},
-            {'baslangic': '09:00', 'bitis': '01:00', 'mbit': day}]
+def plan_times(cfg):
+    """((gece başı, sonu), (gündüz başı, sonu)); Gelişmiş ayarlardan değiştirilebilir."""
+    plan = cfg.get('hiz_plani') or []
+    if len(plan) < 2:
+        return ('01:00', '09:00'), ('09:00', '01:00')
+    return ((plan[0].get('baslangic', '01:00'), plan[0].get('bitis', '09:00')),
+            (plan[1].get('baslangic', '09:00'), plan[1].get('bitis', '01:00')))
+
+
+def make_plan(day, night, cfg=None, times=None):
+    """Hız planı; saatler verilmezse ayarlardakiler (yoksa 01–09 gece, 09–01 gündüz) korunur."""
+    (n0, n1), (d0, d1) = times or plan_times(cfg or {})
+    return [{'baslangic': n0, 'bitis': n1, 'mbit': night}, {'baslangic': d0, 'bitis': d1, 'mbit': day}]
+
+
+def save_track_name(key, value):
+    """Düzenleyicide verilen ses kanalı adı (boşsa varsayılana döner)."""
+    cfg = kk.load_config()
+    names = dict(cfg.get('ses_adlari') or {})
+    if value:
+        names[key] = value
+    else:
+        names.pop(key, None)
+    update_config(ses_adlari=names)
 
 
 def update_config(**changes):
@@ -258,6 +276,55 @@ def collect_stats():
         db.close()
 
 
+# ---------------------------------------------------------------- menü (koyu tema, ikonlu)
+
+MENU_BG, MENU_FG, MENU_HOVER, MENU_LINE = '#1b1b1b', '#e6e6e6', '#2e2e2e', '#2d2d2d'
+DROP_BG, DROP_ACTIVE, DROP_OFF = '#2b2b2b', '#2563eb', '#6b7280'
+ICON_FONTS = (r'C:\Windows\Fonts\SegoeIcons.ttf', r'C:\Windows\Fonts\segmdl2.ttf')  # Windows 11 / 10
+GLYPHS = {'pause': '\uE769', 'play': '\uE768', 'link': '\uE71B', 'pin': '\uE718', 'folder': '\uE8B7',
+          'settings': '\uE713', 'doc': '\uE8A5', 'delete': '\uE74D', 'close': '\uE711', 'search': '\uE721',
+          'check': '\uE73E', 'sync': '\uE895', 'send': '\uE724', 'contact': '\uE77B', 'signout': '\uF3B1',
+          'update': '\uE777', 'notes': '\uE70B', 'help': '\uE897', 'info': '\uE946', 'cloud': '\uE753',
+          'shield': '\uEA18', 'login': '\uE8FA', 'download': '\uE896', 'edit': '\uE70F', 'save': '\uE74E'}
+
+
+class MenuBar(tk.Frame):
+    """Koyu temaya uyan menü çubuğu (Windows'un beyaz menü çubuğu yerine). Menüler her açılışta o anki duruma göre
+    yeniden doldurulur; sağda "Gelişmiş ayarlar"."""
+
+    def __init__(self, app, menus):
+        super().__init__(app, bg=MENU_BG)
+        font = ('Segoe UI', 10)
+        self.fillers, self.menus = {}, {}
+        for label, fill in menus:
+            mb = tk.Menubutton(self, text=label, bg=MENU_BG, fg=MENU_FG, activebackground=MENU_HOVER,
+                               activeforeground=MENU_FG, relief='flat', bd=0, padx=12, pady=5, font=font,
+                               cursor='hand2')
+            menu = tk.Menu(mb, tearoff=False, bg=DROP_BG, fg=MENU_FG, activebackground=DROP_ACTIVE,
+                           activeforeground='white', disabledforeground=DROP_OFF, bd=0, relief='flat',
+                           activeborderwidth=0, font=font)
+            menu.configure(postcommand=lambda m=menu, f=fill: self._fill(m, f))
+            mb.configure(menu=menu)
+            mb.pack(side='left')
+            self.fillers[label], self.menus[label] = fill, menu
+        self.adv = tk.Label(self, text='  Gelişmiş ayarlar ', image=app.icon('settings'), compound='left',
+                            bg=MENU_BG, fg=MENU_FG, padx=10, pady=5, font=font, cursor='hand2')
+        self.adv.pack(side='right', padx=(0, 6))
+        self.adv.bind('<Button-1>', lambda _e: app.open_advanced())
+        self.adv.bind('<Enter>', lambda _e: self.adv.configure(bg=MENU_HOVER))
+        self.adv.bind('<Leave>', lambda _e: self.adv.configure(bg=MENU_BG))
+
+    @staticmethod
+    def _fill(menu, fill):
+        menu.delete(0, 'end')
+        fill(menu)
+
+    def menu(self, label):
+        """Menüyü o anki duruma göre doldurup döndürür (kısayollar ve testler için)."""
+        self._fill(self.menus[label], self.fillers[label])
+        return self.menus[label]
+
+
 class Async:
     """Telegram işleri için ayrı iş parçacığında çalışan asyncio döngüsü."""
 
@@ -391,6 +458,7 @@ class App(tk.Tk):
         # Ekran ölçeklemesine (%125, %150…) ve ekran boyutuna göre pencere boyu; küçük ekranda taşmasın
         scale = max(1.0, self.winfo_fpixels('1i') / 96.0)
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.ui_scale = scale
         w, h = min(int(1040 * scale), sw - 40), min(int(900 * scale), sh - 90)
         self.geometry(f'{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 2 - 20)}')
         self.minsize(min(int(900 * scale), w), min(int(620 * scale), h))
@@ -423,7 +491,14 @@ class App(tk.Tk):
         self.autostart = tk.BooleanVar(value=False)  # Windows açılınca otomatik başlat (görev açık mı)
         self.note = ttk.Label(self, text='', style='Muted.TLabel', padding=(20, 4))
         self._note_job = None
+        self._icons = {}
+        self.adv = None           # Gelişmiş ayarlar penceresi
         self._build_menu()
+        for seq, fn in (('<Control-d>', self.menu_pause), ('<Control-D>', self.menu_pause),
+                        ('<F5>', self.menu_scan), ('<Control-u>', self.menu_check_updates),
+                        ('<Control-U>', self.menu_check_updates), ('<F1>', self.menu_help),
+                        ('<Control-comma>', self.open_advanced)):
+            self.bind(seq, lambda _e, fn=fn: self._shortcut(fn))
         self.show(self.first_view())
         self.check_updates()
         self._refresh_autostart()
@@ -441,6 +516,8 @@ class App(tk.Tk):
             self._refresh_uploader()
         if not kk.GUNCELLEME_REPO:
             return {'durum': 'kapali'}
+        if not manual and not kk.load_config().get('otomatik_guncelle', True):
+            return None  # otomatik güncelleme kapalı: sadece elle
         if kk.is_dev_copy() and not manual:
             return None  # geliştirme kopyası açılışta hiç bakmaz
         m = kk.fetch_manifest()
@@ -530,6 +607,8 @@ class App(tk.Tk):
     @staticmethod
     def first_view():
         c = kk.load_config()
+        if c.get('telegramsiz'):
+            return DashboardView  # Telegram'sız kullanım: yedekleme kapalı, geri kalan her şey açık
         if not (c.get('kanal_id') and c.get('kaynaklar')):
             return SetupView
         # kurulu ama Telegram girişi yok (çıkış yapılmış): sadece giriş ekranı, ayarlar olduğu gibi kalır
@@ -543,11 +622,6 @@ class App(tk.Tk):
         if self.banner is not None:
             self.banner.pack_forget()
             self.banner.pack(fill='x', before=self.view)
-        on = 'normal' if isinstance(self.view, DashboardView) else 'disabled'
-        for label in ('Yedek', 'Hesap'):
-            self.menubar.entryconfigure(label, state=on)
-        for i in (0, 1):  # duraklat, otomatik başlat
-            self.m_program.entryconfigure(i, state=on)
 
     def say(self, text, color=GREY, secs=10):
         """Pencerenin altında kısa bilgi (menüden yapılan işler için). secs=0: kalıcı."""
@@ -558,60 +632,124 @@ class App(tk.Tk):
         self._note_job = self.after(secs * 1000, self.note.pack_forget) if secs else None
 
     # ------------------------------------------------ menü
+    def icon(self, name, off=False):
+        """Windows'un simge fontundan (Segoe Fluent Icons / MDL2 Assets) küçük ikon; font yoksa boş."""
+        key = (name, off)
+        if key not in self._icons:
+            size = max(16, round(16 * self.ui_scale))
+            img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+            path = next((f for f in ICON_FONTS if os.path.exists(f)), None)
+            if path and name in GLYPHS:
+                ImageDraw.Draw(img).text((size / 2, size / 2), GLYPHS[name], anchor='mm',
+                                         font=ImageFont.truetype(path, size - 2), fill=DROP_OFF if off else MENU_FG)
+            self._icons[key] = ImageTk.PhotoImage(img, master=self)
+        return self._icons[key]
+
+    def item(self, menu, label, ico, command=None, accel=None, enabled=True):
+        menu.add_command(label=f'  {label}', image=self.icon(ico, off=not enabled), compound='left',
+                         command=command, accelerator=accel or '', state='normal' if enabled else 'disabled')
+
     def _build_menu(self):
-        mb = self.menubar = tk.Menu(self, tearoff=False)
-        self.config(menu=mb)
-        m = self.m_program = tk.Menu(mb, tearoff=False, postcommand=self._program_menu_opening)
-        mb.add_cascade(label='Program', menu=m)
-        m.add_command(label='Yedeklemeyi duraklat', command=self.menu_pause)
-        m.add_checkbutton(label='Windows açılınca otomatik başlat', variable=self.autostart,
-                          command=self.toggle_autostart)
+        self.menubar = MenuBar(self, [('Program', self._fill_program), ('Yedek', self._fill_backup),
+                                      ('Hesap', self._fill_account), ('Yardım', self._fill_help)])
+        self.menubar.pack(side='top', fill='x')
+        tk.Frame(self, height=1, bg=MENU_LINE).pack(side='top', fill='x')
+
+    def _modes(self):
+        """(Durum ekranında mı, Telegram'sız mı)"""
+        return isinstance(self.view, DashboardView), bool(kk.load_config().get('telegramsiz'))
+
+    def _fill_program(self, m):
+        dash, local = self._modes()
+        if dash and local:
+            self.item(m, "Telegram'a bağlan…", 'login', self.connect_telegram)
+            m.add_separator()
+        elif dash:
+            paused = bool(kk.load_config().get('duraklat')) or not kk.uploader_alive()
+            self.item(m, 'Yedeklemeye devam et' if paused else 'Yedeklemeyi duraklat', 'play' if paused else 'pause',
+                      self.menu_pause, 'Ctrl+D')
+            self.item(m, 'Windows açılınca otomatik başlat', 'check' if self.autostart.get() else 'blank',
+                      self.menu_toggle_autostart)
+            m.add_separator()
+        self.item(m, 'Masaüstüne kısayol koy', 'link', lambda: self.menu_shortcut(0))
+        self.item(m, 'Başlat menüsüne ekle', 'pin', lambda: self.menu_shortcut(1))
         m.add_separator()
-        m.add_command(label='Masaüstüne kısayol koy', command=lambda: self.menu_shortcut(0))
-        m.add_command(label='Başlat menüsüne ekle', command=lambda: self.menu_shortcut(1))
+        self.item(m, 'Program klasörünü aç', 'folder', lambda: os.startfile(BASE))
+        self.item(m, 'Ayar klasörünü aç', 'folder', self.menu_open_data)
+        self.item(m, 'Günlüğü aç', 'doc', self.menu_open_log)
         m.add_separator()
-        m.add_command(label='Program klasörünü aç', command=lambda: os.startfile(BASE))
-        m.add_command(label='Ayar klasörünü aç', command=self.menu_open_data)
-        m.add_command(label='Günlüğü aç', command=self.menu_open_log)
+        self.item(m, 'Gelişmiş ayarlar…', 'settings', self.open_advanced, 'Ctrl+,')
         m.add_separator()
-        m.add_command(label='Programı kaldır…', command=self.menu_uninstall)
-        m.add_command(label='Pencereyi kapat', command=self.destroy)
-        m = tk.Menu(mb, tearoff=False)
-        mb.add_cascade(label='Yedek', menu=m)
-        m.add_command(label='Klasörleri şimdi tara', command=self.menu_scan)
-        m.add_command(label="Telegram'daki yedekleri doğrula", command=self.menu_verify)
-        m.add_command(label="Kayıtları Telegram'dan yeniden kur…", command=self.menu_reindex)
+        self.item(m, 'Programı kaldır…', 'delete', self.menu_uninstall)
+        self.item(m, 'Kapat', 'close', self.destroy, 'Alt+F4')
+
+    def _fill_backup(self, m):
+        dash, local = self._modes()
+        tg = dash and not local
+        self.item(m, 'Klasörleri şimdi tara', 'search', self.menu_scan, 'F5', enabled=dash)
+        self.item(m, "Telegram'daki yedekleri doğrula", 'shield', self.menu_verify, enabled=tg)
+        self.item(m, "Kayıtları Telegram'dan yeniden kur…", 'sync', self.menu_reindex, enabled=tg)
         m.add_separator()
-        m.add_command(label="Arşiv grubunu Telegram'da aç", command=lambda: self._on_dashboard('open_telegram'))
-        m = self.m_account = tk.Menu(mb, tearoff=False, postcommand=self._account_menu_opening)
-        mb.add_cascade(label='Hesap', menu=m)
-        m.add_command(label='Telegram hesabı', state='disabled')
-        m.add_separator()
-        m.add_command(label="Telegram'dan çıkış yap…", command=lambda: self._on_dashboard('logout'))
-        m = tk.Menu(mb, tearoff=False)
-        mb.add_cascade(label='Yardım', menu=m)
-        m.add_command(label='Güncellemeleri kontrol et', command=self.menu_check_updates)
-        m.add_command(label='Sürüm notları', command=lambda: webbrowser.open(
+        self.item(m, "Arşiv grubunu Telegram'da aç", 'send', lambda: self._on_dashboard('open_telegram'), enabled=tg)
+        self.item(m, 'Klipleri geri yükle…', 'download', lambda: self._select_tab('restore'), enabled=tg)
+        self.item(m, 'Klip düzenle…', 'edit', lambda: self._select_tab('edit'), enabled=dash)
+
+    def _fill_account(self, m):
+        dash, local = self._modes()
+        h = kk.load_config().get('hesap')
+        if dash and not local:
+            self.item(m, account_text(h) if h else 'Telegram hesabı', 'contact', enabled=False)
+            m.add_separator()
+            self.item(m, 'Hesap ayrıntıları', 'info', lambda: self._select_tab('settings'))
+            self.item(m, "Telegram'dan çıkış yap…", 'signout', lambda: self._on_dashboard('logout'))
+        else:
+            self.item(m, "Telegram'a bağlı değil", 'contact', enabled=False)
+            m.add_separator()
+            self.item(m, "Telegram'a bağlan…", 'login', self.connect_telegram, enabled=dash)
+
+    def _fill_help(self, m):
+        self.item(m, 'Güncellemeleri kontrol et', 'update', self.menu_check_updates, 'Ctrl+U')
+        self.item(m, 'Sürüm notları', 'notes', lambda: webbrowser.open(
             f'https://github.com/{kk.GUNCELLEME_REPO}/releases'))
-        m.add_command(label='Nasıl kullanılır', command=self.menu_help)
+        self.item(m, 'Nasıl kullanılır', 'help', self.menu_help, 'F1')
         m.add_separator()
-        m.add_command(label='Hakkında', command=self.menu_about)
+        self.item(m, 'Hakkında', 'info', self.menu_about)
+
+    def _shortcut(self, fn):
+        if isinstance(self.focus_get(), (tk.Entry, ttk.Entry, tk.Text)):
+            return None  # yazı yazılırken kısayollar karışmasın
+        fn()
+        return 'break'
 
     def _on_dashboard(self, method):
         if isinstance(self.view, DashboardView):
             getattr(self.view, method)()
 
-    def _program_menu_opening(self):
-        if isinstance(self.view, DashboardView):
-            paused = bool(kk.load_config().get('duraklat')) or not kk.uploader_alive()
-            self.m_program.entryconfigure(0, label='Yedeklemeye devam et' if paused else 'Yedeklemeyi duraklat')
+    def _select_tab(self, key):
+        if isinstance(self.view, DashboardView) and key in self.view.tabs:
+            self.view.nb.select(self.view.tabs[key])
 
-    def _account_menu_opening(self):
-        h = kk.load_config().get('hesap')
-        self.m_account.entryconfigure(0, label=account_text(h) if h else 'Telegram hesabı')
+    def connect_telegram(self):
+        """Telegram'sız kullanımdan yedeklemeye geçiş: giriş ekranı."""
+        self.show(LoginView)
+
+    def open_advanced(self):
+        if self.adv is not None and self.adv.winfo_exists():
+            self.adv.deiconify()
+            self.adv.lift()
+            self.adv.focus_set()
+        else:
+            self.adv = AdvancedSettings(self)
+        return self.adv
 
     def menu_pause(self):
-        self._on_dashboard('toggle_pause')
+        dash, local = self._modes()
+        if dash and not local:
+            self.view.toggle_pause()
+
+    def menu_toggle_autostart(self):
+        self.autostart.set(not self.autostart.get())
+        self.toggle_autostart()
 
     # otomatik başlatma (menüde ve Ayarlar sekmesinde aynı anahtar)
     def _refresh_autostart(self):
@@ -679,6 +817,8 @@ class App(tk.Tk):
         return False
 
     def menu_scan(self):
+        if not isinstance(self.view, DashboardView):
+            return
         self.say('Klasörler taranıyor…', secs=0)
         self.bg(self._scan, self._scanned)
 
@@ -943,6 +1083,38 @@ class LoginBox(ttk.LabelFrame):
         self.say(text, ORANGE)
 
 
+class ApiBox(ttk.LabelFrame):
+    """Telegram API bilgisi: paketle gelmediyse bir kere sorulur (my.telegram.org)."""
+
+    def __init__(self, parent, title=' Telegram API bilgisi '):
+        super().__init__(parent, text=title, padding=12)
+        ttk.Label(self, text='my.telegram.org → telefonunla giriş → "API development tools" → herhangi bir ad ile '
+                             'uygulama oluştur → api_id ve api_hash\'i buraya yapıştır (bir kere).',
+                  style='Muted.TLabel', wraplength=880).pack(anchor='w')
+        r = ttk.Frame(self)
+        r.pack(fill='x', pady=(8, 0))
+        ttk.Label(r, text='api_id:').pack(side='left')
+        self.api_id = ttk.Entry(r, width=14)
+        self.api_id.pack(side='left', padx=6)
+        ttk.Label(r, text='  api_hash:').pack(side='left')
+        self.api_hash = ttk.Entry(r, width=36)
+        self.api_hash.pack(side='left', padx=6)
+        ttk.Button(r, text='my.telegram.org\'u aç',
+                   command=lambda: webbrowser.open('https://my.telegram.org/apps')).pack(side='left', padx=8)
+
+    def save(self, box):
+        api_id, api_hash = self.api_id.get().strip(), self.api_hash.get().strip()
+        if not api_id.isdigit() or len(api_hash) != 32:
+            box.say('Önce api_id (sadece rakam) ve api_hash\'i (32 karakter) yaz.', ORANGE)
+            return False
+        update_config(api_id=int(api_id), api_hash=api_hash)
+        return True
+
+
+LOCAL_NOTE = ('Klipler yedeklenmez; düzenleyici, klasörler ve oyun özetleri çalışır. İstediğin zaman '
+              'Hesap > Telegram\'a bağlan ile yedeklemeyi açabilirsin.')
+
+
 class LoginView(ttk.Frame):
     """Kurulu programda sadece Telegram'a yeniden giriş (çıkış yaptıktan ya da oturum kapandıktan sonra).
     Klasörler, hız ayarları ve yedek kayıtları olduğu gibi kalır."""
@@ -951,22 +1123,43 @@ class LoginView(ttk.Frame):
         super().__init__(app, padding=(24, 18))
         self.app = app
         self.new_archive = False
-        ttk.Label(self, text='Telegram girişi', style='Title.TLabel').pack(anchor='w')
-        ttk.Label(self, text='Klasörlerin, hız ayarların ve Telegram\'daki yedeklerin olduğu gibi duruyor; '
-                             'yedeklemenin sürmesi için tekrar giriş yapman yeterli.',
-                  style='Muted.TLabel', wraplength=900).pack(anchor='w', pady=(2, 0))
-        h = kk.load_config().get('hesap')
-        if h:
+        cfg = kk.load_config()
+        self.was_local = bool(cfg.get('telegramsiz'))
+        h = cfg.get('hesap')
+        if h and not self.was_local:
+            ttk.Label(self, text='Telegram girişi', style='Title.TLabel').pack(anchor='w')
+            ttk.Label(self, text='Klasörlerin, hız ayarların ve Telegram\'daki yedeklerin olduğu gibi duruyor; '
+                                 'yedeklemenin sürmesi için tekrar giriş yapman yeterli.',
+                      style='Muted.TLabel', wraplength=900).pack(anchor='w', pady=(2, 0))
             ttk.Label(self, text=f'Arşiv grubu şu hesapta: {account_text(h)}. Aynı hesapla girersen kaldığı yerden '
                                  'devam eder.', style='Muted.TLabel', wraplength=900).pack(anchor='w', pady=(2, 0))
-        self.box = LoginBox(self, app, ' Telegram hesabı ', self._on_login)
+        else:
+            ttk.Label(self, text='Telegram\'a bağlan', style='Title.TLabel').pack(anchor='w')
+            ttk.Label(self, text='Klipleri Telegram\'da sadece senin göreceğin gizli bir gruba yedeklemek için giriş yap. '
+                                 'Klasörlerin ve ayarların olduğu gibi kalır.',
+                      style='Muted.TLabel', wraplength=900).pack(anchor='w', pady=(2, 0))
+        self.api = None
+        if not (cfg.get('api_id') and cfg.get('api_hash')):
+            self.api = ApiBox(self)
+            self.api.pack(fill='x', pady=(14, 0))
+        self.box = LoginBox(self, app, ' Telegram hesabı ', self._on_login,
+                            (lambda: self.api.save(self.box)) if self.api else None)
         self.box.pack(fill='x', pady=(14, 0))
         bottom = ttk.Frame(self)
         bottom.pack(fill='x', pady=(14, 0))
-        self.msg = ttk.Label(bottom, text='', style='Muted.TLabel', wraplength=760, justify='left')
+        self.local_btn = ttk.Button(bottom, text='Telegram olmadan devam et', command=self.continue_local)
+        self.local_btn.pack(side='right')
+        self.msg = ttk.Label(bottom, text='', style='Muted.TLabel', wraplength=640, justify='left')
         self.msg.pack(side='left')
         self.retry_btn = ttk.Button(bottom, text='Tekrar dene', command=self._on_login)
-        self.box.check_existing()
+        if self.api is None:
+            self.box.check_existing()
+
+    def continue_local(self):
+        if not messagebox.askyesno('Klip Kalkanı', 'Telegram olmadan devam edilsin mi?\n\n' + LOCAL_NOTE):
+            return
+        update_config(telegramsiz=True)
+        self.app.show(DashboardView)
 
     def _on_login(self):
         self.retry_btn.pack_forget()
@@ -978,7 +1171,7 @@ class LoginView(ttk.Frame):
             state, info = fut.result()
         except Exception as e:
             self.msg.configure(text=f'Olmadı: {friendly_error(e)}', foreground=RED)
-            self.retry_btn.pack(side='right')
+            self.retry_btn.pack(side='right', padx=8)
             return
         if state == 'erisim_yok':
             if messagebox.askyesno('Klip Kalkanı', f'{account_text(info)} hesabında Klip Kalkanı arşiv grubu yok; '
@@ -993,7 +1186,8 @@ class LoginView(ttk.Frame):
                 self.app.async_.run(self.box.login.cancel(), self._cancelled)
             return
         self.new_archive = state == 'yeni'
-        self.msg.configure(text='Yedekleme yeniden başlatılıyor…', foreground=GREY)
+        update_config(telegramsiz=False)  # Telegram'sız kullanımdan yedeklemeye geçildi
+        self.msg.configure(text='Yedekleme başlatılıyor…', foreground=GREY)
         self.app.bg(self._resume, self._resumed)
 
     def _cancelled(self, fut):
@@ -1018,8 +1212,14 @@ class LoginView(ttk.Frame):
 
     def _resumed(self, res):
         ok, started = res
-        text = ('Yeni arşiv grubu açıldı; klipler bu hesaba baştan yüklenecek.' if self.new_archive
-                else 'Giriş tamam.')
+        first = self.new_archive and (self.was_local or not kk.load_config().get('eski_kanallar'))
+        if first:
+            text = 'Telegram\'a bağlandın; gizli arşiv grubu açıldı.'
+            if not kk.load_config().get('kaynaklar'):
+                text += ' Klasörler sekmesinden klip klasörlerini eklemeyi unutma.'
+        else:
+            text = ('Yeni arşiv grubu açıldı; klipler bu hesaba baştan yüklenecek.' if self.new_archive
+                    else 'Giriş tamam.')
         if not ok:
             text += f'\n\nOtomatik başlatma açılamadı: {started}'
         elif not started:
@@ -1057,22 +1257,10 @@ class SetupView(ttk.Frame):
         # 0) API bilgisi (sadece paketle gelmediyse sorulur)
         cfg = kk.load_config()
         self.need_api = not (cfg.get('api_id') and cfg.get('api_hash'))
+        self.api = None
         if self.need_api:
-            box = ttk.LabelFrame(self, text=' 0. Telegram API bilgisi ', padding=12)
-            box.pack(fill='x', pady=(0, 12))
-            ttk.Label(box, text='my.telegram.org → telefonunla giriş → "API development tools" → herhangi bir ad ile '
-                                'uygulama oluştur → api_id ve api_hash\'i buraya yapıştır (bir kere).',
-                      style='Muted.TLabel', wraplength=880).pack(anchor='w')
-            r = ttk.Frame(box)
-            r.pack(fill='x', pady=(8, 0))
-            ttk.Label(r, text='api_id:').pack(side='left')
-            self.api_id = ttk.Entry(r, width=14)
-            self.api_id.pack(side='left', padx=6)
-            ttk.Label(r, text='  api_hash:').pack(side='left')
-            self.api_hash = ttk.Entry(r, width=36)
-            self.api_hash.pack(side='left', padx=6)
-            ttk.Button(r, text='my.telegram.org\'u aç',
-                       command=lambda: webbrowser.open('https://my.telegram.org/apps')).pack(side='left', padx=8)
+            self.api = ApiBox(self, ' 0. Telegram API bilgisi ')
+            self.api.pack(fill='x', pady=(0, 12))
 
         # 1) klasörler
         box = ttk.LabelFrame(self, text=' 1. Klip klasörleri ', padding=12)
@@ -1110,6 +1298,9 @@ class SetupView(ttk.Frame):
         # 3) telegram
         self.box = LoginBox(self, app, ' 3. Telegram girişi ', self._on_login, self._save_api)
         self.box.pack(fill='x', pady=(12, 0))
+        ttk.Label(self, text='Telegram\'ın yoksa ya da şimdilik istemiyorsan aşağıdaki "Telegram olmadan devam et" ile '
+                             'sadece düzenleyiciyi, klasörleri ve oyun özetlerini kullanabilirsin.',
+                  style='Muted.TLabel', wraplength=900).pack(anchor='w', pady=(6, 0))
 
         # bitir
         bottom = ttk.Frame(self)
@@ -1121,6 +1312,8 @@ class SetupView(ttk.Frame):
         self.finish_btn = ttk.Button(bottom, text='Kurulumu bitir', style='Accent.TButton', command=self.finish,
                                      state='disabled')
         self.finish_btn.pack(side='right')
+        self.local_btn = ttk.Button(bottom, text='Telegram olmadan devam et', command=self.finish_local)
+        self.local_btn.pack(side='right', padx=(0, 8))
         self.finish_msg = ttk.Label(bottom, text='', style='Muted.TLabel')
         self.finish_msg.pack(side='right', padx=12)
 
@@ -1182,14 +1375,30 @@ class SetupView(ttk.Frame):
     # --- telegram
     def _save_api(self):
         """Kod istenmeden önce: API bilgisi paketle gelmediyse kutulardan alınır."""
-        if not self.need_api:
-            return True
-        api_id, api_hash = self.api_id.get().strip(), self.api_hash.get().strip()
-        if not api_id.isdigit() or len(api_hash) != 32:
-            self.box.say('Önce yukarıya api_id (sadece rakam) ve api_hash\'i (32 karakter) yaz.', ORANGE)
-            return False
-        update_config(api_id=int(api_id), api_hash=api_hash)
+        return self.api.save(self.box) if self.api is not None else True
+
+    def finish_local(self):
+        """Telegram'a bağlanmadan: seçili klasörler ve hız kaydedilir, yedekleme (arka plan görevi) kurulmaz."""
+        if not messagebox.askyesno('Klip Kalkanı', 'Telegram\'a bağlanmadan devam edilsin mi?\n\n' + LOCAL_NOTE):
+            return
+        day, night = choice_to_mbit(self.day.get()), choice_to_mbit(self.night.get())
+        day, night = (8 if day is None else day), (20 if night is None else night)
+        update_config(kaynaklar=[s for v, s in self.folder_vars if v.get()], hiz_plani=make_plan(day, night),
+                      max_hiz_mbit=day, telegramsiz=True)
+        self.app.bg(self._shortcuts, self._local_done, self.shortcut.get(), self.start_menu.get())
+
+    @staticmethod
+    def _shortcuts(desktop, start_menu):
+        for want, lnk in zip((desktop, start_menu), shortcut_paths()):
+            if want:
+                make_shortcut(lnk)
         return True
+
+    def _local_done(self, res):
+        ok, val = res
+        if not ok:
+            messagebox.showerror('Klip Kalkanı', f'Kısayol konamadı:\n{val}')
+        self.app.show(DashboardView)
 
     def _on_login(self):
         self.logged_in = True
@@ -1309,7 +1518,8 @@ class DashboardView(ttk.Frame):
             f = ttk.Frame(nb, padding=12)
             nb.add(f, text='  Düzenle  ')
             self.tabs['edit'] = f
-            self.editor = duzenle.EditorTab(f, app)
+            self.editor = duzenle.EditorTab(f, app, names_get=lambda: kk.load_config().get('ses_adlari') or {},
+                                            names_set=save_track_name)
         except ImportError:
             pass
         f = ttk.Frame(nb, padding=16)
@@ -1318,6 +1528,18 @@ class DashboardView(ttk.Frame):
         self._build_settings()
         self._tick()
         self._refresh_stats()
+        if kk.load_config().get('telegramsiz'):  # yükleyici çalışmıyor: klasörleri pencere tarar
+            self.app.bg(self._local_scan, lambda res: self.refresh_now())
+
+    @staticmethod
+    def _local_scan():
+        db = kk.open_db()
+        try:
+            last = kk.meta_get(db, 'son_tarama')
+        finally:
+            db.close()
+        if last is None or time.time() - last > 600:
+            return kk.scan(kk.load_config())
 
     def destroy(self):
         """Çıkış yapınca ekran değişir: zamanlayıcıları ve açık klibin oynatıcısını kapat."""
@@ -1428,6 +1650,13 @@ class DashboardView(ttk.Frame):
     def _tick(self):
         """Her saniye: durum.json'dan anlık bilgi."""
         cfg = kk.load_config()
+        if cfg.get('telegramsiz'):
+            self.pause_btn.configure(text='☁  Telegram\'a bağlan')
+            self._set_state(GREY, 'Telegram\'sız kullanıyorsun', LOCAL_NOTE)
+            self._set_current(None, {})
+            self.bg_label.configure(text='Telegram\'sız kullanım · yedekleme kapalı')
+            self._tick_job = self.after(1000, self._tick)
+            return
         s = kk.read_json(kk.STATUS_PATH, {}) or {}
         alive = kk.uploader_alive()
         paused_flag = bool(cfg.get('duraklat'))
@@ -1573,6 +1802,9 @@ class DashboardView(ttk.Frame):
 
     def toggle_pause(self):
         cfg = kk.load_config()
+        if cfg.get('telegramsiz'):
+            self.app.connect_telegram()
+            return
         alive = kk.uploader_alive()
         if cfg.get('duraklat') or not alive:
             update_config(duraklat=False)
@@ -1642,12 +1874,15 @@ class DashboardView(ttk.Frame):
                           'gece yüksek tutabilirsin.', style='Muted.TLabel', wraplength=880).pack(anchor='w', pady=(2, 12))
         g = ttk.Frame(t)
         g.pack(anchor='w')
-        ttk.Label(g, text='Gündüz (09:00–01:00):').grid(row=0, column=0, sticky='w', pady=4)
+        (n0, n1), (d0, d1) = plan_times(cfg)
+        self.lbl_day = ttk.Label(g, text=f'Gündüz ({d0}–{d1}):')
+        self.lbl_day.grid(row=0, column=0, sticky='w', pady=4)
         self.s_day = ttk.Combobox(g, values=SPEED_CHOICES, width=14)
         self.s_day.set(mbit_to_choice(day))
         self.s_day.grid(row=0, column=1, padx=8)
         ttk.Label(g, text='Mbit').grid(row=0, column=2, sticky='w')
-        ttk.Label(g, text='Gece (01:00–09:00):').grid(row=1, column=0, sticky='w', pady=4)
+        self.lbl_night = ttk.Label(g, text=f'Gece ({n0}–{n1}):')
+        self.lbl_night.grid(row=1, column=0, sticky='w', pady=4)
         self.s_night = ttk.Combobox(g, values=SPEED_CHOICES, width=14)
         self.s_night.set(mbit_to_choice(night))
         self.s_night.grid(row=1, column=1, padx=8)
@@ -1667,13 +1902,25 @@ class DashboardView(ttk.Frame):
         self.speed_msg = ttk.Label(t, text='', style='Muted.TLabel', wraplength=880)
         self.speed_msg.pack(anchor='w', pady=(10, 0))
 
+    def refresh_settings(self):
+        """Gelişmiş ayarlar kaydedilince Hız sekmesi de güncellensin."""
+        cfg = kk.load_config()
+        day, night = plan_values(cfg)
+        (n0, n1), (d0, d1) = plan_times(cfg)
+        self.s_day.set(mbit_to_choice(day))
+        self.s_night.set(mbit_to_choice(night))
+        self.lbl_day.configure(text=f'Gündüz ({d0}–{d1}):')
+        self.lbl_night.configure(text=f'Gece ({n0}–{n1}):')
+        self.v_game.set(bool(cfg.get('oyunda_dur', True)))
+        self.v_awake.set(bool(cfg.get('uyku_engelle', True)))
+
     def save_speed(self):
         day, night = choice_to_mbit(self.s_day.get()), choice_to_mbit(self.s_night.get())
         if day is None or night is None:
             self.speed_msg.configure(text='Listeden seç ya da sayı yaz (Mbit).')
             return
-        update_config(hiz_plani=make_plan(day, night), max_hiz_mbit=day, oyunda_dur=self.v_game.get(),
-                      uyku_engelle=self.v_awake.get())
+        update_config(hiz_plani=make_plan(day, night, kk.load_config()), max_hiz_mbit=day,
+                      oyunda_dur=self.v_game.get(), uyku_engelle=self.v_awake.get())
         self.speed_msg.configure(text='✔ Kaydedildi. Arka plan birkaç saniye içinde yeni ayarla devam eder.',
                                  foreground=GREEN)
 
@@ -1798,12 +2045,20 @@ class DashboardView(ttk.Frame):
         self.logout_btn.pack(side='right')
         self.acc_sub = ttk.Label(box, text='', style='Muted.TLabel', wraplength=880, justify='left')
         self.acc_sub.pack(anchor='w', pady=(4, 0))
-        ttk.Label(box, text='Çıkış yapınca yedekleme durur ve bu bilgisayardaki giriş silinir; Telegram\'daki arşiv '
-                            'grubu ve klipler olduğu gibi kalır. Aynı hesapla tekrar girince kaldığı yerden devam eder.',
-                  style='Muted.TLabel', wraplength=880, justify='left').pack(anchor='w', pady=(8, 0))
-        h = kk.load_config().get('hesap')
-        if h:
-            self._show_account(h)
+        self.acc_note = ttk.Label(box, text='Çıkış yapınca yedekleme durur ve bu bilgisayardaki giriş silinir; '
+                                            'Telegram\'daki arşiv grubu ve klipler olduğu gibi kalır. Aynı hesapla '
+                                            'tekrar girince kaldığı yerden devam eder.',
+                                  style='Muted.TLabel', wraplength=880, justify='left')
+        self.acc_note.pack(anchor='w', pady=(8, 0))
+        cfg = kk.load_config()
+        if cfg.get('telegramsiz'):
+            self.acc_label.configure(text='Telegram\'a bağlı değil')
+            self.acc_sub.configure(text=LOCAL_NOTE, foreground=GREY)
+            self.logout_btn.configure(text='Telegram\'a bağlan', style='Accent.TButton', command=self.app.connect_telegram)
+            self.acc_note.configure(text='Bağlanınca Telegram\'da sadece senin göreceğin gizli bir arşiv grubu açılır ve '
+                                         'klipler oraya yedeklenmeye başlar.')
+        elif cfg.get('hesap'):
+            self._show_account(cfg['hesap'])
 
         box = ttk.LabelFrame(t, text=' Başlangıç ', padding=12)
         box.pack(fill='x', pady=(14, 0))
@@ -1842,7 +2097,7 @@ class DashboardView(ttk.Frame):
 
     def load_account(self):
         """Hesap bilgisini Telegram'dan tazeler (pencere başına bir kere)."""
-        if self._acc_loaded or self._acc_busy:
+        if self._acc_loaded or self._acc_busy or kk.load_config().get('telegramsiz'):
             return
         self._acc_busy = True
         if not kk.load_config().get('hesap'):
@@ -2048,6 +2303,10 @@ class DashboardView(ttk.Frame):
     def start_restore(self):
         if self.restore_future and not self.restore_future.done():
             return
+        if kk.load_config().get('telegramsiz'):
+            messagebox.showinfo('Klip Kalkanı', 'Geri yüklemek için önce Telegram\'a bağlanman lazım '
+                                                '(Hesap > Telegram\'a bağlan).')
+            return
         target = self.r_target.get().strip()
         if not target:
             self.r_msg.configure(text='Hedef klasörü seç.')
@@ -2163,6 +2422,263 @@ class DashboardView(ttk.Frame):
         if self.restore_future and not self.restore_future.done():
             self.restore_future.cancel()
             self.r_all_lbl.configure(text='Durduruluyor…')
+
+
+# ---------------------------------------------------------------- Gelişmiş ayarlar
+
+def _int(text, lo, hi, label):
+    try:
+        v = int(str(text).strip())
+    except ValueError:
+        v = None
+    if v is None or not lo <= v <= hi:
+        raise ValueError(f'"{label}": {lo} ile {hi} arasında bir sayı yaz.')
+    return v
+
+
+def _hhmm(text, label):
+    t = str(text).strip().replace('.', ':')
+    try:
+        h, m = (int(x) for x in t.split(':'))
+    except ValueError:
+        h = m = -1
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        raise ValueError(f'"{label}": saati SS:DD biçiminde yaz (örn. 01:00).')
+    return f'{h:02d}:{m:02d}'
+
+
+class AdvancedSettings(tk.Toplevel):
+    """Gelişmiş ayarlar: ayarlar.json'daki her şey tek yerde. Kaydedince arka plan birkaç saniye içinde uygular.
+    (Klip klasörleri Klasörler sekmesinde, Telegram hesabı Ayarlar sekmesinde.)"""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title('Gelişmiş ayarlar')
+        self.transient(app)
+        s = app.ui_scale
+        self.geometry(f'{int(840 * s)}x{int(740 * s)}')
+        self.minsize(int(640 * s), int(460 * s))
+        if os.path.exists(ICON_PATH):
+            try:
+                self.iconbitmap(ICON_PATH)
+            except tk.TclError:
+                pass
+        self.bgc = ttk.Style(self).lookup('TFrame', 'background') or '#1c1c1c'
+        self.configure(bg=self.bgc)
+        self.fields = {}    # anahtar → (okuyucu, yazıcı)
+        bottom = ttk.Frame(self, padding=(16, 10))
+        bottom.pack(side='bottom', fill='x')
+        ttk.Button(bottom, text='Varsayılanlara dön', command=self.reset).pack(side='left')
+        ttk.Button(bottom, text='Kaydet', style='Accent.TButton', command=self.save).pack(side='right')
+        ttk.Button(bottom, text='Vazgeç', command=self.destroy).pack(side='right', padx=8)
+        canvas = tk.Canvas(self, bg=self.bgc, highlightthickness=0)
+        sb = ttk.Scrollbar(self, orient='vertical', command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side='right', fill='y')
+        canvas.pack(side='left', fill='both', expand=True)
+        self.body = ttk.Frame(canvas, padding=(18, 14))
+        win = canvas.create_window(0, 0, window=self.body, anchor='nw')
+        self.body.bind('<Configure>', lambda _e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>', lambda e: canvas.itemconfigure(win, width=e.width))
+        self.bind('<MouseWheel>', lambda e: canvas.yview_scroll(int(-e.delta / 120), 'units'))
+        self.bind('<Escape>', lambda _e: self.destroy())
+        self._build(kk.load_config())
+        self.focus_set()
+
+    # alan yardımcıları
+    def section(self, title, note=None):
+        box = ttk.LabelFrame(self.body, text=f' {title} ', padding=12)
+        box.pack(fill='x', pady=(0, 12))
+        box.columnconfigure(1, weight=1)
+        if note:
+            ttk.Label(box, text=note, style='Muted.TLabel', wraplength=720, justify='left').grid(
+                row=0, column=0, columnspan=3, sticky='w', pady=(0, 6))
+        return box
+
+    @staticmethod
+    def _row(box, label, widget, hint=None):
+        r = box.grid_size()[1]
+        ttk.Label(box, text=label).grid(row=r, column=0, sticky='nw', pady=4, padx=(0, 12))
+        widget.grid(row=r, column=1, sticky='w', pady=4)
+        if hint:
+            ttk.Label(box, text=hint, style='Muted.TLabel', wraplength=560, justify='left').grid(
+                row=r + 1, column=1, sticky='w', pady=(0, 6))
+
+    def check(self, box, key, label, value, hint=None):
+        var = tk.BooleanVar(value=bool(value))
+        r = box.grid_size()[1]
+        ttk.Checkbutton(box, text=label, variable=var).grid(row=r, column=0, columnspan=2, sticky='w', pady=3)
+        if hint:
+            ttk.Label(box, text=hint, style='Muted.TLabel', wraplength=640, justify='left').grid(
+                row=r + 1, column=0, columnspan=2, sticky='w', padx=(28, 0), pady=(0, 6))
+        self.fields[key] = (var.get, var.set)
+
+    def number(self, box, key, label, value, lo, hi, hint=None):
+        var = tk.StringVar(value=str(value))
+        self._row(box, label, ttk.Spinbox(box, from_=lo, to=hi, textvariable=var, width=8), hint)
+        self.fields[key] = (lambda: _int(var.get(), lo, hi, label), lambda v: var.set(str(v)))
+
+    def text(self, box, key, label, value, hint=None, width=36):
+        var = tk.StringVar(value=value or '')
+        self._row(box, label, ttk.Entry(box, textvariable=var, width=width), hint)
+        self.fields[key] = (lambda: var.get().strip(), lambda v: var.set(v or ''))
+
+    def lines(self, box, key, label, value, hint=None, height=4, as_dict=False):
+        frame = tk.Frame(box, bg='#3a3a3a', padx=1, pady=1)
+        t = tk.Text(frame, height=height, width=58, bg='#262626', fg=MENU_FG, insertbackground=MENU_FG,
+                    relief='flat', font=('Consolas', 10), wrap='none', undo=True)
+        t.pack(fill='both', expand=True)
+        self._row(box, label, frame, hint)
+
+        def fmt(v):
+            if as_dict:
+                return '\n'.join(f'{k} = {x}' for k, x in (v or {}).items())
+            return '\n'.join(v or [])
+
+        def get():
+            rows = [x.strip() for x in t.get('1.0', 'end').splitlines() if x.strip()]
+            if not as_dict:
+                return rows
+            out = {}
+            for x in rows:
+                if '=' not in x:
+                    raise ValueError(f'"{label}": her satır "ad = değer" biçiminde olmalı ("{x}").')
+                k, v = x.split('=', 1)
+                if k.strip() and v.strip():
+                    out[k.strip()] = v.strip()
+            return out
+
+        def put(v):
+            t.delete('1.0', 'end')
+            t.insert('1.0', fmt(v))
+        put(value)
+        self.fields[key] = (get, put)
+
+    def _build(self, cfg):
+        ttk.Label(self.body, text='Gelişmiş ayarlar', style='Title.TLabel').pack(anchor='w')
+        ttk.Label(self.body, text='Buradaki her şey ayarlar dosyasında durur. Kaydedince arka plan birkaç saniye içinde '
+                                  'yeni ayarlarla devam eder. Klip klasörleri Klasörler sekmesinde, Telegram hesabı '
+                                  'Ayarlar sekmesinde.', style='Muted.TLabel', wraplength=740).pack(anchor='w',
+                                                                                                    pady=(2, 14))
+        # yükleme hızı: [gece, gündüz] saatleri ve limitleri
+        box = self.section('Yükleme hızı', 'İki zaman dilimi: gece yüksek, gündüz düşük tutulabilir. Saatler 24 saat '
+                                           'biçiminde; bitiş başlangıçtan küçükse gece yarısını geçer.')
+        (n0, n1), (d0, d1) = plan_times(cfg)
+        day, night = plan_values(cfg)
+        self.plan = {}
+        for key, label, t0, t1, mbit in (('gece', 'Gece', n0, n1, night), ('gunduz', 'Gündüz', d0, d1, day)):
+            r = ttk.Frame(box)
+            a, b = tk.StringVar(value=t0), tk.StringVar(value=t1)
+            ttk.Entry(r, textvariable=a, width=6).pack(side='left')
+            ttk.Label(r, text=' – ').pack(side='left')
+            ttk.Entry(r, textvariable=b, width=6).pack(side='left')
+            cb = ttk.Combobox(r, values=SPEED_CHOICES, width=12)
+            cb.set(mbit_to_choice(mbit))
+            cb.pack(side='left', padx=(16, 6))
+            ttk.Label(r, text='Mbit').pack(side='left')
+            self._row(box, label + ':', r)
+            self.plan[key] = (label, a, b, cb)
+        mx = ttk.Combobox(box, values=SPEED_CHOICES, width=12)
+        mx.set(mbit_to_choice(cfg.get('max_hiz_mbit') or UNLIMITED))
+        self._row(box, 'Plan dışı saatler:', mx, 'Plana girmeyen saatlerde en fazla bu hız (Mbit).')
+        self.fields['max_hiz_mbit'] = (lambda: self._mbit(mx.get(), 'Plan dışı saatler'),
+                                       lambda v: mx.set(mbit_to_choice(v or UNLIMITED)))
+        self.number(box, 'paralel_parca', 'Aynı anda giden parça:', cfg.get('paralel_parca', 8), 1, 32,
+                    'Genelde 8 yeter; çok artırmak hızı artırmaz, bağlantıyı zorlar.')
+
+        box = self.section('Oyun algılama')
+        self.check(box, 'oyunda_dur', 'Oyun açıkken yüklemeyi durdur (ping bozulmasın)', cfg.get('oyunda_dur', True))
+        self.check(box, 'tam_ekranda_dur', 'Tam ekran bir uygulama açıkken de durdur', cfg.get('tam_ekranda_dur', True))
+        self.number(box, 'oyun_kapaninca_bekle_sn', 'Oyun kapanınca bekle (sn):', cfg.get('oyun_kapaninca_bekle_sn', 60),
+                    0, 3600)
+        self.lines(box, 'oyun_exe', 'Oyun programları:', cfg.get('oyun_exe'),
+                   'Her satıra bir .exe adı. Unreal oyunları (…-Win64-Shipping.exe) zaten tanınır.', height=6)
+
+        box = self.section('Tarama ve sıra')
+        self.number(box, 'tarama_dakika', 'Klasörleri tarama (dk):', cfg.get('tarama_dakika', 10), 1, 1440,
+                    'Yeni klipler en geç bu kadar dakikada fark edilir.')
+        self.number(box, 'yeni_klip_gun', 'Öne geçen yeni klipler (gün):', cfg.get('yeni_klip_gun', 3), 0, 365,
+                    'Son bu kadar günün klipleri eski arşivden önce yüklenir.')
+        self.text(box, 'uzantilar', 'Video uzantıları:', ', '.join(cfg.get('uzantilar') or []),
+                  'Virgülle ayır (örn. .mp4, .mkv, .mov).')
+        self.lines(box, 'genel_klasorler', 'Oyun adı olmayan klasörler:', cfg.get('genel_klasorler'),
+                   'Her satıra bir klasör adı (ör. yedek klasörlerin); oyun adı bunların altındaki klasörden okunur.')
+        self.lines(box, 'oyun_takma_adlari', 'Oyun adı düzeltmeleri:', cfg.get('oyun_takma_adlari'),
+                   'Her satıra "klasör adı = oyun adı" (ör. buradavalorant = Valorant).', as_dict=True)
+
+        box = self.section('Telegram')
+        self.check(box, 'oyun_konulari', 'Her oyuna arşiv grubunda ayrı konu (topic) aç', cfg.get('oyun_konulari', True))
+        self.text(box, 'kanal_adi', 'Yeni arşiv grubunun adı:', cfg.get('kanal_adi'),
+                  'Sadece yeni bir grup açılırsa kullanılır; var olan grubun adı Telegram\'dan değişir.', width=30)
+
+        box = self.section('Düzenleyici')
+        self.lines(box, 'ses_adlari', 'Ses kanalı adları:', cfg.get('ses_adlari'),
+                   'Her satıra "orijinal ad = senin verdiğin ad" (ör. r5apex_dx12 = Apex). Düzenle sekmesinde ✎ ile de '
+                   'değişir.', as_dict=True)
+
+        box = self.section('Diğer')
+        self.check(box, 'uyku_engelle', 'Yükleme sürerken bilgisayar uykuya geçmesin (prizdeyken)',
+                   cfg.get('uyku_engelle', True))
+        self.check(box, 'otomatik_guncelle', 'Yeni sürümleri kendiliğinden kur', cfg.get('otomatik_guncelle', True),
+                   'Kapalıyken Yardım > Güncellemeleri kontrol et ile elle kurarsın.')
+
+        box = self.section('Bilgi')
+        mode = 'Telegram\'sız (yedekleme kapalı)' if cfg.get('telegramsiz') else 'Telegram\'a yedekleme'
+        for label, value, path in (('Sürüm:', kk.VERSION, None), ('Kullanım:', mode, None),
+                                   ('Program klasörü:', BASE, BASE), ('Ayar klasörü:', kk.DATA_DIR, kk.DATA_DIR)):
+            r = ttk.Frame(box)
+            ttk.Label(r, text=value, style='Muted.TLabel').pack(side='left')
+            if path:
+                ttk.Button(r, text='Aç', command=lambda p=path: os.startfile(p)).pack(side='left', padx=8)
+            self._row(box, label, r)
+
+    @staticmethod
+    def _mbit(text, label):
+        v = choice_to_mbit(text)
+        if v is None:
+            raise ValueError(f'"{label}": listeden seç ya da Mbit olarak sayı yaz.')
+        return v
+
+    def collect(self):
+        out = {key: get() for key, (get, _) in self.fields.items()}
+        out['uzantilar'] = [('.' + x.lstrip('.')).lower() for x in
+                            out['uzantilar'].replace(';', ',').replace(' ', ',').split(',') if x.strip('. ')]
+        if not out['uzantilar']:
+            raise ValueError('"Video uzantıları": en az bir uzantı yaz.')
+        out['kanal_adi'] = out['kanal_adi'] or kk.DEFAULT_CONFIG['kanal_adi']
+        plan = []
+        for key in ('gece', 'gunduz'):
+            label, a, b, cb = self.plan[key]
+            plan.append({'baslangic': _hhmm(a.get(), label + ' başlangıcı'), 'bitis': _hhmm(b.get(), label + ' bitişi'),
+                         'mbit': self._mbit(cb.get(), label)})
+        out['hiz_plani'] = plan
+        return out
+
+    def reset(self):
+        d = kk.DEFAULT_CONFIG
+        for key, (_, put) in self.fields.items():
+            if key == 'uzantilar':
+                put(', '.join(d['uzantilar']))
+            elif key in d:
+                put(d[key])
+        for key, p in zip(('gece', 'gunduz'), d['hiz_plani']):
+            _, a, b, cb = self.plan[key]
+            a.set(p['baslangic'])
+            b.set(p['bitis'])
+            cb.set(mbit_to_choice(p['mbit']))
+
+    def save(self):
+        try:
+            changes = self.collect()
+        except ValueError as e:
+            messagebox.showerror('Gelişmiş ayarlar', str(e), parent=self)
+            return
+        update_config(**changes)
+        if isinstance(self.app.view, DashboardView):
+            self.app.view.refresh_settings()
+        self.app.say('✔ Gelişmiş ayarlar kaydedildi; arka plan birkaç saniye içinde yeni ayarlarla devam eder.', GREEN)
+        self.destroy()
 
 
 def main():
