@@ -51,7 +51,7 @@ import time
 
 import psutil
 
-VERSION = '1.10'
+VERSION = '1.11'
 BASE = os.path.dirname(os.path.abspath(__file__))  # program dosyaları
 APPDATA_DIR = os.path.join(os.environ.get('APPDATA') or os.path.join(os.path.expanduser('~'), 'AppData', 'Roaming'),
                            'KlipKalkani')
@@ -62,7 +62,7 @@ DATA_PATTERNS = ('klip_kalkani*.session*', 'klip_kalkani.*.db', 'durum.json')
 def set_data_dir(d):
     """Kullanıcı verisinin (ayarlar, giriş, veritabanı, durum, günlük) durduğu klasör."""
     global DATA_DIR, CONFIG_PATH, DB_PATH, SESSION_BASE, SESSION_FILE, LOGIN_SESSION_BASE, STATUS_PATH, LOG_DIR
-    global SCAN_REQUEST, KAPALI_PATH
+    global SCAN_REQUEST, KAPALI_PATH, RESTART_REQUEST
     DATA_DIR = d
     CONFIG_PATH = os.path.join(d, 'ayarlar.json')
     DB_PATH = os.path.join(d, 'klip_kalkani.db')
@@ -73,6 +73,7 @@ def set_data_dir(d):
     LOG_DIR = os.path.join(d, 'log')
     SCAN_REQUEST = os.path.join(d, 'tara.istek')  # pencere "şimdi tara" deyince yükleyici hemen tarar
     KAPALI_PATH = os.path.join(d, 'kapatildi.json')  # "tamamen kapat": bu Windows oturumunda yükleyici açılmaz
+    RESTART_REQUEST = os.path.join(d, 'yenile.istek')  # pencere yeni sürümü kurdu: klip bitince yeni kodla yeniden başla
 
 
 def _same(a, b):
@@ -125,6 +126,7 @@ DEFAULT_CONFIG = {
     ],
     'max_hiz_mbit': 8,            # plana uymayan saatler için (0 = sınırsız)
     'duraklat': False,            # arayüzdeki Duraklat tuşu
+    'bitince_duraklat': False,    # "bu klip bitince duraklat": yüklenen klip biter, sıradakine geçilmeden duraklar
     'paralel_parca': 8,
     'oyunda_dur': True,           # aşağıdaki oyunlardan biri (veya herhangi bir Unreal oyunu) açıkken yükleme durur
     'tam_ekranda_dur': True,      # özel tam ekran (exclusive fullscreen) bir oyun varken de durur
@@ -860,6 +862,13 @@ STATE_TEXT = {'basliyor': 'başlıyor', 'baglaniyor': "Telegram'a bağlanıyor",
               'kapatildi': 'kapatıldı', 'telegramsiz': "Telegram'sız kullanım"}
 
 
+def uploading_now(s, cfg):
+    """Şu an bir klip yükleniyor mu (ya da oyun / saat planı yüzünden yarıda bekliyor mu)? "Bu klip bitince duraklat"
+    sadece o zaman anlamlı. s: durum.json, cfg: ayarlar."""
+    return (bool(s.get('dosya')) and not cfg.get('duraklat')
+            and s.get('durum') in ('yukleniyor', 'hazirlaniyor', 'duraklatildi'))
+
+
 def status_line(s):
     """Durumun kısa Türkçe açıklaması (simgenin ipucu ve menüsü için)."""
     d = s.get('durum')
@@ -926,12 +935,17 @@ class Gate:
             log.warning('ayarlar.json okunamadı: %s', e)
             return
         for key in ('hiz_plani', 'max_hiz_mbit', 'oyunda_dur', 'tam_ekranda_dur', 'oyun_exe',
-                    'oyun_kapaninca_bekle_sn', 'uyku_engelle', 'paralel_parca', 'duraklat',
+                    'oyun_kapaninca_bekle_sn', 'uyku_engelle', 'paralel_parca', 'duraklat', 'bitince_duraklat',
                     'kaynaklar', 'yeni_klip_gun', 'tarama_dakika', 'uzantilar', 'genel_klasorler',
                     'oyun_takma_adlari', 'oyun_konulari', 'otomatik_guncelle', 'kanal_adi'):
             self.cfg[key] = new.get(key)
         self.names = {n.lower() for n in self.cfg.get('oyun_exe') or []}
         log.info('Ayarlar değişti, yeniden yüklendi')
+
+    def manually_paused(self):
+        """Duraklat'a basılmış mı? (ayar dosyası değiştiyse yeniden okur)"""
+        self.reload_if_changed()
+        return bool(self.cfg.get('duraklat'))
 
     async def wait(self, nbytes):
         while True:
@@ -954,7 +968,9 @@ class Gate:
                     if not self.reason:
                         log.info('Duraklatıldı: %s', reason)
                     self.reason = reason
-                    self.resume_at = now + self.cfg.get('oyun_kapaninca_bekle_sn', 60)
+                    # oyun kapanınca biraz beklenir; elle duraklatmada "Devam et" hemen sürsün
+                    self.resume_at = now + (0 if reason == 'elle duraklatıldı'
+                                            else self.cfg.get('oyun_kapaninca_bekle_sn', 60))
                 elif self.reason and now >= self.resume_at:
                     log.info('Devam ediliyor')
                     self.reason = None
@@ -1168,7 +1184,7 @@ async def upload_blob(ctx, row, fp, st, deadline):
         meta_set(db, 'istatistik', stats)
         log.info('Yüklendi: %s%s (%s, %s, %s/sn)', base, f' [parça {idx + 1}/{nparts}]' if nparts > 1 else '',
                  fmt_size(length), fmt_duration(active), fmt_size(length / active))
-        if idx + 1 < nparts and time.time() > deadline:
+        if idx + 1 < nparts and time.time() > deadline and not ctx.gate.cfg.get('bitince_duraklat'):
             return 'yield'
     db.execute("UPDATE blobs SET status='done', sha256=?, done_at=?, attempts=0, next_try=0, last_error=NULL "
                'WHERE fp=?', (sha if nparts == 1 else None, time.time(), fp))
@@ -1931,7 +1947,7 @@ class Tray:
 
     WM_TRAY = 0x8000 + 1       # WM_APP + 1: simgeye tıklandı
     WM_QUIT_APP = 0x8000 + 2   # pencere yükleyicinin kapanmasını istiyor (simgeyi kaldırıp çıkar)
-    OPEN, PAUSE, SCAN, QUIT = 1, 2, 3, 4
+    OPEN, PAUSE, SCAN, QUIT, AFTER = 1, 2, 3, 4, 5
 
     def __init__(self, status, cls=TRAY_CLASS, hidden=False):
         self.status = status
@@ -2031,9 +2047,11 @@ class Tray:
 
     def status_text(self):
         s = self.status.snapshot()
-        if load_config().get('duraklat') and s.get('durum') in (None, 'hazir', 'yukleniyor', 'duraklatildi'):
+        cfg = load_config()
+        if cfg.get('duraklat') and s.get('durum') in (None, 'hazir', 'yukleniyor', 'duraklatildi'):
             return 'Klip Kalkanı · duraklatıldı'
-        return ('Klip Kalkanı · ' + status_line(s))[:127]
+        after = ' · bitince duraklar' if cfg.get('bitince_duraklat') and uploading_now(s, cfg) else ''
+        return 'Klip Kalkanı · ' + status_line(s)[:127 - 15 - len(after)] + after
 
     def refresh(self):
         sh = _win32().sh
@@ -2066,7 +2084,8 @@ class Tray:
     def menu(self):
         api = _win32()
         u = api.u32
-        paused = bool(load_config().get('duraklat'))
+        cfg = load_config()
+        paused = bool(cfg.get('duraklat'))
         m = u.CreatePopupMenu()
         try:
             u.AppendMenuW(m, 0x1, 0, self.status_text())   # MF_GRAYED: sadece bilgi
@@ -2074,6 +2093,8 @@ class Tray:
             u.AppendMenuW(m, 0, self.OPEN, "Klip Kalkanı'nı aç")
             u.SetMenuDefaultItem(m, self.OPEN, 0)
             u.AppendMenuW(m, 0, self.PAUSE, 'Yedeklemeye devam et' if paused else 'Yedeklemeyi duraklat')
+            if uploading_now(self.status.snapshot(), cfg):  # işaretliyse istenmiş demek (MF_CHECKED)
+                u.AppendMenuW(m, 0x8 if cfg.get('bitince_duraklat') else 0, self.AFTER, 'Bu klip bitince duraklat')
             u.AppendMenuW(m, 0, self.SCAN, 'Klasörleri şimdi tara')
             u.AppendMenuW(m, 0x800, 0, None)
             u.AppendMenuW(m, 0, self.QUIT, 'Çıkış (yedekleme durur)')
@@ -2094,8 +2115,13 @@ class Tray:
             self.open()
         elif cmd == self.PAUSE:
             paused = bool(load_config().get('duraklat'))
-            update_config(duraklat=not paused)
+            update_config(duraklat=not paused, bitince_duraklat=False)
             log.info('Simgeden %s', 'devam edildi' if paused else 'duraklatıldı')
+            self.refresh()
+        elif cmd == self.AFTER:
+            on = not load_config().get('bitince_duraklat')
+            update_config(bitince_duraklat=on)
+            log.info('Simgeden: bu klip bitince duraklat %s', 'istendi' if on else 'isteği geri alındı')
             self.refresh()
         elif cmd == self.SCAN:
             request_scan()
@@ -2137,9 +2163,17 @@ def remove_tray():
             pass
 
 
+def _restart_command():
+    """Yükleyici kapandıktan sonra çalışacak komut: önce görev; görev açamazsa (ör. görev bozuk, yükleyici doğrudan
+    başlatılmıştı) yükleyicinin kendisi. İkisi de açılırsa ikincisi tek kopya kuralıyla hemen kapanır."""
+    direct = f'start "" "{pythonw_path()}" -E -s "{os.path.join(BASE, "klip_kalkani.py")}" calis'
+    return (f'cmd /c ping -n 6 127.0.0.1 >nul & schtasks /Run /TN "{TASK_NAME}" & '
+            f'ping -n 12 127.0.0.1 >nul & {direct}')
+
+
 def restart_uploader():
     """Güncellemeden sonra arka plandaki yükleyiciyi yeni kodla yeniden başlatır."""
-    cmd = f'cmd /c ping -n 6 127.0.0.1 >nul & schtasks /Run /TN "{TASK_NAME}"'
+    cmd = _restart_command()
     for flags in (0x08000000 | 0x01000000, 0x08000000):  # pencere yok (+ görev kutusundan kopar)
         try:
             subprocess.Popen(cmd, creationflags=flags, close_fds=True)
@@ -2473,6 +2507,30 @@ def adopt_old_install(src):
             run_task()
 
 
+def request_restart():
+    """Yükleyiciye "yüklediğin klip bitince yeni kodla yeniden başla" der (1.11 ve sonrası anlar)."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if not os.path.exists(RESTART_REQUEST):  # ilk isteğin zamanı kalsın: çok beklerse zorla yeniden başlatılır
+        with open(RESTART_REQUEST, 'w', encoding='utf-8') as f:
+            f.write(str(time.time()))
+
+
+def restart_for_update():
+    """Program dosyaları yenilendi: arka plan da yeni kodla açılsın. O an bir klip yüklüyorsa (ve isteği anlayacak
+    kadar yeni bir sürümse) klip bitince kendisi yeniden başlar, klip yarım kalmaz; klip yüklemiyorsa ya da istek
+    2 saattir bekliyorsa hemen yeniden başlatılır. Dönüş: 'istek' ya da 'hemen'."""
+    s = read_json(STATUS_PATH, {}) or {}
+    try:
+        waited = time.time() - os.path.getmtime(RESTART_REQUEST)
+    except OSError:
+        waited = 0
+    if _version_tuple(s.get('surum') or '0') >= (1, 11) and uploading_now(s, load_config()) and waited < 7200:
+        request_restart()
+        return 'istek'
+    restart_task()
+    return 'hemen'
+
+
 def request_scan():
     """Arka plandaki yükleyiciye "hemen tara" der (sıradaki dosyadan önce, en geç bir dakikada tarar)."""
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -2510,6 +2568,10 @@ async def cmd_run(cfg, limit=None):
     db = open_db()
     started = time.time()
     log.info('Klip Kalkanı %s başladı (pid %d, %s)', VERSION, os.getpid(), BASE)
+    try:  # önceki çalışmadan kalma "yeniden başla" isteği: zaten yeni kodla açıldık
+        os.remove(RESTART_REQUEST)
+    except OSError:
+        pass
     if load_config().get('telegramsiz'):
         log.info("Telegram'sız kullanım seçili: yedekleme kapalı, yükleyici çalışmıyor")
         status.update(force=True, durum='telegramsiz', sebep=None)
@@ -2564,6 +2626,15 @@ async def upload_loop(client, cfg, db, status, limit, started):
     queue = []
     done = 0
     worked = False
+
+    def pause_if_requested():
+        """"Bu klip bitince duraklat" istenmişse ve şu an yüklenen klip yoksa duraklatır (sıradakine geçilmez)."""
+        ctx.gate.reload_if_changed()
+        if cfg.get('bitince_duraklat'):
+            update_config(duraklat=True, bitince_duraklat=False)
+            cfg.update(duraklat=True, bitince_duraklat=False)
+            log.info('Klip bitti; istendiği gibi duraklatıldı (sıradaki klibe geçilmedi)')
+
     while True:
         now = time.time()
         if os.path.exists(SCAN_REQUEST):  # pencereden "şimdi tara" istendi
@@ -2603,6 +2674,21 @@ async def upload_loop(client, cfg, db, status, limit, started):
                     restart_uploader()
             except Exception as e:
                 log.warning('Güncelleme denetlenemedi: %s', e)
+        if os.path.exists(RESTART_REQUEST):  # pencere yeni sürümü kurdu; şu an klipler arasındayız, yarım kalan yok
+            try:
+                os.remove(RESTART_REQUEST)
+            except OSError:
+                pass
+            log.info('Program dosyaları yenilenmiş; yeni sürümle yeniden başlatılıyor')
+            keep_awake(False)
+            restart_uploader()
+        pause_if_requested()
+        if ctx.gate.manually_paused():  # klipler arasında duraklatıldı: sıradakine başlamadan bekle
+            keep_awake(False)
+            first = status.data.get('durum') != 'duraklatildi' or status.data.get('dosya') is not None
+            status.update(force=first, durum='duraklatildi', sebep='elle duraklatıldı', dosya=None)
+            await asyncio.sleep(3)
+            continue
         if not queue:
             keep_awake(False)
             status.update(force=True, durum='hazir', dosya=None, sebep=None)
@@ -2617,7 +2703,13 @@ async def upload_loop(client, cfg, db, status, limit, started):
             await asyncio.sleep(max(5.0, min(60.0, next_scan - time.time())))
             continue
         row = queue.pop(0)
-        result = await process_item(ctx, row, next_scan)
+        while True:
+            result = await process_item(ctx, row, next_scan)
+            ctx.gate.reload_if_changed()
+            if result == 'yield' and cfg.get('bitince_duraklat'):
+                continue  # parçalı klip: "bitince duraklat" istendi, araya başka klip girmeden bitsin
+            break
+        pause_if_requested()
         if result == 'done':
             done += 1
             worked = True

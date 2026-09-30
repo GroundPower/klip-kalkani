@@ -40,6 +40,8 @@ NE YAPAR
   kalitede ve önizlemeli video olarak gider. Telefondan da izlenir.
 - Bilgisayar her açıldığında arka planda kendiliğinden çalışır, yeni klipleri de yükler.
 - Oyun açıkken yükleme durur, ping'in bozulmaz. Gündüz/gece hız sınırı pencereden değişir.
+- "Bu klip bitince duraklat" (Durum sekmesi, menü ya da saatin yanındaki simge): yüklenen klip biter,
+  sıradakine geçilmeden yedekleme duraklar; "Devam et" ile sürer.
 - Düzenle sekmesi: sesli önizleme, kayıpsız kesme, tam kare kesme (NVIDIA), klip birleştirme.
   Ses kanalları (tüm ses / oyun / Discord / mikrofon): aç/kapat, seviye, tek dinle; kaydederken hepsini tek
   kanalda birleştir (Discord'da ve telefonda her şey duyulsun) ya da ayrı kanallar olarak kaydet.

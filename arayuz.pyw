@@ -538,7 +538,7 @@ class App(tk.Tk):
             return {'durum': 'guncel', 'uzak': remote}
         new = kk.apply_update(m)
         if kk.task_state() == 'acik' and kk.uploader_alive():
-            kk.restart_task()  # arka plandaki yükleyici de yeni kodla başlasın
+            kk.restart_for_update()  # arka plan da yeni kodla açılsın (klip yüklüyorsa klip bitince)
         return {'durum': 'kuruldu', 'surum': new}
 
     @staticmethod
@@ -548,7 +548,7 @@ class App(tk.Tk):
         try:
             s = kk.read_json(kk.STATUS_PATH, {}) or {}
             if kk.uploader_alive() and s.get('surum') != kk.VERSION and kk.task_state() == 'acik':
-                kk.restart_task()
+                kk.restart_for_update()
         except Exception as e:
             print('yükleyici yenilenemedi:', e)
 
@@ -763,6 +763,9 @@ class App(tk.Tk):
             paused = bool(kk.load_config().get('duraklat')) or not kk.uploader_alive()
             self.item(m, 'Yedeklemeye devam et' if paused else 'Yedeklemeyi duraklat', 'play' if paused else 'pause',
                       self.menu_pause, 'Ctrl+D')
+            cur, after = self.view.pause_after_state()
+            self.item(m, 'Bu klip bitince duraklat', 'check' if after else 'blank', self.view.toggle_pause_after,
+                      enabled=cur)
             self.item(m, 'Windows açılınca otomatik başlat', 'check' if self.autostart.get() else 'blank',
                       self.menu_toggle_autostart)
             m.add_separator()
@@ -1693,8 +1696,13 @@ class DashboardView(ttk.Frame):
         self.cur_meta.pack(anchor='w')
         self.cur_bar = ttk.Progressbar(cur, maximum=100)
         self.cur_bar.pack(fill='x', pady=(8, 4))
-        self.cur_info = ttk.Label(cur, text='', style='Muted.TLabel')
-        self.cur_info.pack(anchor='w')
+        bottom = ttk.Frame(cur)
+        bottom.pack(fill='x')
+        self.cur_info = ttk.Label(bottom, text='', style='Muted.TLabel')
+        self.cur_info.pack(side='left')
+        # yüklenen klip biter, sıradakine geçilmeden duraklar; yeniden basınca vazgeçilir
+        self.after_btn = ttk.Button(bottom, text=AFTER_TEXT[0], command=self.toggle_pause_after, state='disabled')
+        self.after_btn.pack(side='right')
 
         tot = ttk.LabelFrame(t, text=' Toplam ilerleme ', padding=12)
         tot.pack(fill='x', pady=(12, 0))
@@ -1757,6 +1765,7 @@ class DashboardView(ttk.Frame):
             self.pause_btn.configure(text='☁  Telegram\'a bağlan')
             self._set_state(GREY, 'Telegram\'sız kullanıyorsun', LOCAL_NOTE)
             self._set_current(None, {})
+            self.after_btn.configure(text=AFTER_TEXT[0], state='disabled')
             self.bg_label.configure(text='Telegram\'sız kullanım · yedekleme kapalı')
             self._tick_job = self.after(1000, self._tick)
             return
@@ -1765,6 +1774,10 @@ class DashboardView(ttk.Frame):
         paused_flag = bool(cfg.get('duraklat'))
         self.pause_btn.configure(text='▶  Devam et' if paused_flag or not alive else '⏸  Duraklat',
                                  state='disabled' if self.starting else 'normal')
+        cur = alive and kk.uploading_now(s, cfg)             # şu an bir klip yükleniyor
+        after = cur and bool(cfg.get('bitince_duraklat'))     # "bu klip bitince duraklat" istenmiş
+        self.after_btn.configure(text=AFTER_TEXT[after], state='normal' if cur else 'disabled')
+        note = ' Bu klip bitince duraklatılacak, sıradakine geçilmeyecek.' if after else ''
         d = s.get('durum') if alive else None
         if not alive:
             if time.time() - self._ts[0] > 10:
@@ -1798,14 +1811,15 @@ class DashboardView(ttk.Frame):
             self._set_current(None, s)
         elif d == 'yukleniyor':
             self._set_state(GREEN, 'Yükleniyor', f'Hız sınırı şu an: {self._limit_text(cfg)}. '
-                                                 'Oyun açılınca kendiliğinden durur.')
+                                                 'Oyun açılınca kendiliğinden durur.' + note)
             self._set_current(s.get('dosya'), s)
         elif d == 'duraklatildi':
             sebep = s.get('sebep') or ''
             if sebep == 'elle duraklatıldı':
                 self._set_state(ORANGE, 'Duraklatıldı', 'Devam et\'e basınca kaldığı yerden sürer.')
             elif sebep.startswith('oyun'):
-                self._set_state(ORANGE, 'Oyun açık, bekliyor', sebep + '. Oyun kapanınca 1 dk sonra devam eder.')
+                self._set_state(ORANGE, 'Oyun açık, bekliyor', sebep + '. Oyun kapanınca 1 dk sonra devam eder.'
+                                + note)
             else:
                 self._set_state(ORANGE, 'Bekliyor', sebep)
             self._set_current(s.get('dosya'), s)
@@ -1949,12 +1963,27 @@ class DashboardView(ttk.Frame):
             return
         alive = kk.uploader_alive()
         if cfg.get('duraklat') or not alive:
-            update_config(duraklat=False)
+            update_config(duraklat=False, bitince_duraklat=False)
             if not alive:
                 self.start_backup()
             self._ts = (0, 'acik')
         else:
-            update_config(duraklat=True)
+            update_config(duraklat=True, bitince_duraklat=False)
+
+    def pause_after_state(self):
+        """(şu an bir klip yükleniyor mu, "bu klip bitince duraklat" istenmiş mi)"""
+        cfg = kk.load_config()
+        cur = (not cfg.get('telegramsiz') and kk.uploader_alive()
+               and kk.uploading_now(kk.read_json(kk.STATUS_PATH, {}) or {}, cfg))
+        return cur, cur and bool(cfg.get('bitince_duraklat'))
+
+    def toggle_pause_after(self):
+        """"Bu klip bitince duraklat": yüklenen klip biter, sıradakine geçilmeden yedekleme duraklar (Devam et ile
+        sürer). Klip bitmeden yeniden basılırsa vazgeçilir."""
+        cur, after = self.pause_after_state()
+        if cur:
+            update_config(bitince_duraklat=not after)
+            self.after_btn.configure(text=AFTER_TEXT[not after])
 
     def start_backup(self):
         """Arka planı başlatır ve gerçekten açıldığını bekler (takılı kalanı kapatır, görevi onarır, gerekirse
@@ -2850,6 +2879,7 @@ class AdvancedSettings(tk.Toplevel):
         self.destroy()
 
 
+AFTER_TEXT = ('Bu klip bitince duraklat', '✓ Bitince duraklatılacak · vazgeç')
 STEP_TEXT = {'basliyor': ('Başlıyor…', 'Arka plan açıldı, hazırlanıyor.'),
              'baglaniyor': ("Telegram'a bağlanıyor…", 'Genelde birkaç saniye sürer.'),
              'taraniyor': ('Klasörler taranıyor…', 'Yeni klipler aranıyor; çok dosyalı klasörlerde ilk tarama birkaç '

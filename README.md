@@ -11,6 +11,7 @@ Oyun kliplerini (Medal, NVIDIA, Outplayed, OBS, Xbox Game Bar…) **Telegram'da 
 - **Orijinal kalite:** Dosyalar yeniden sıkıştırılmaz. Telegram'da önizlemeli video olarak durur, telefondan izlenir. 2 GB'tan büyük dosyalar (Premium'da 4 GB) parçalı yüklenir, geri indirilirken birleştirilir.
 - **Her oyun ayrı konuda:** Arşiv, forum modundaki bir grup. League of Legends, Valorant, Apex… her birinin kendi konusu var.
 - **Oyunu bozmaz:** Oyun açıkken yükleme durur. Gündüz ve gece için ayrı hız sınırı konabilir.
+- **Bu klip bitince duraklat:** Durum sekmesindeki düğme (menüde ve saatin yanındaki simgede de var): yüklenen klip biter, sıradakine geçilmeden yedekleme duraklar. "Devam et" ile kaldığı yerden sürer.
 - **Kopyaları ayıklar:** Aynı klip farklı klasörlerde olsa da bir kere yüklenir.
 - **Geri yükleme:** Oyuna, aya ya da isme göre seçip indirir. Her parça SHA-256 ile orijinaline karşı doğrulanır.
 - **Düzenle:** Sesli önizleme (60 FPS / tam FPS), zaman çubuğu, A–B seçimi, **kayıpsız kesme** (saniyeler sürer), **tam kare kesme** (NVIDIA NVENC) ve **kayıpsız birleştirme**.
