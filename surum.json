@@ -1,11 +1,11 @@
 {
-  "surum": "1.11",
-  "etiket": "v1.11",
-  "tarih": "2026-09-30",
-  "notlar": "Bu klip bitince duraklat: yüklenen klip biter, sıradakine geçilmeden yedekleme duraklar (Durum sekmesi, menü, simge); Devam et hemen sürer; güncelleme yüklenen klibi yarıda kesmez.",
+  "surum": "1.12",
+  "etiket": "v1.12",
+  "tarih": "2026-10-11",
+  "notlar": "Cloudflare R2'ye ikinci kopya: istenirse her klip Telegram'dan sonra kendi R2 kovana da yüklenir (Gelişmiş ayarlar > Cloudflare R2 ve galeri, Bağlantıyı dene); oyun, tarih, süre ve kaydeden program bilgisiyle. Yarım kalan yükleme kaldığı yerden sürer, hız sınırı ve oyun algılama R2 için de geçerli. Yedek > Galeriyi aç.",
   "dosyalar": {
-    "klip_kalkani.py": "831628409fd8ea8d38aa546fc802346bf426f5b45d2dbe7064c637604a77321d",
-    "arayuz.pyw": "b792cf25d2c4b25a4c800aa586d60d6be2392049767c3ebaecf5dfa2364ea0b1",
+    "klip_kalkani.py": "6a9e58455550b6851adc9a8a4fdb4374f70a849c5f202b16b7fe0a8bf54c11ab",
+    "arayuz.pyw": "ff1de77fa20cd7349b98618ba4dcc6d67a2d8e67aa80d972a9fefe3eae66d549",
     "duzenle.py": "bb59edfc4d871a6343a2025a7c34fa0d5a6bd328a06224d68c187896da4d69b9",
     "kalkan.ico": "e6190e96224a6adf554c9811b09a956be68943c4d48433d8e4435aeaee971504",
     "Klip Kalkanı.exe": "6e3b66fa809f7c58a09e41ce067c424995258ed1a7c4a7fe33f2b1925fc6d202"

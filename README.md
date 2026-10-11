@@ -22,6 +22,7 @@ Oyun kliplerini (Medal, NVIDIA, Outplayed, OBS, Xbox Game Bar…) **Telegram'da 
 - **Gelişmiş ayarlar:** Sağ üstteki düğmeden bütün ayarlar tek yerde: hız planının saatleri ve limitleri, oyun listesi, tarama aralığı, uzantılar, oyun adı düzeltmeleri, ses kanalı adları, otomatik güncelleme…
 - **Telegram'sız kullanım:** Kurulumda ya da giriş ekranında "Telegram olmadan devam et": düzenleyici, klasörler ve oyun özetleri çalışır, yedekleme kapalı kalır. İstendiğinde Hesap > Telegram'a bağlan.
 - **Ayarlar kaybolmaz:** Ayarlar, Telegram girişi ve yedek kayıtları `%APPDATA%\KlipKalkani`'de durur. Yeni sürüm başka klasöre açılsa da ayarlar gelir. 1.6 ve önceki sürümlerin program klasöründeki ayarları ilk açılışta oraya taşınır.
+- **Cloudflare R2'ye ikinci kopya (isteğe bağlı):** Gelişmiş ayarlardan açılırsa Telegram'a yüklenen her klip kendi R2 kovana da yüklenir; oyun, tarih, süre ve kaydeden program (Medal, NVIDIA, OBS, Outplayed…) bilgisiyle. Bir galeri sitesi klipleri oradan gösterebilir. Kurulum: aşağıdaki [Cloudflare R2](#cloudflare-r2-isteğe-bağlı) bölümü.
 - **Hiçbir şey silmez:** Ne bilgisayardaki dosyalara ne de Telegram'daki yedeklere dokunur.
 
 ## Kurulum
@@ -35,11 +36,26 @@ Oyun kliplerini (Medal, NVIDIA, Outplayed, OBS, Xbox Game Bar…) **Telegram'da 
 
 Python kurmana gerek yok. Paket kendi taşınabilir Python'uyla gelir.
 
+## Cloudflare R2 (isteğe bağlı)
+
+1. Cloudflare panelinde **R2 Object Storage**'ı etkinleştir (ilk 10 GB/ay ücretsiz, sonrası GB başına aylık 0,015 $, indirme ücretsiz) ve bir kova oluştur, ör. `klipler`. Kovayı herkese açık yapma.
+2. R2 → **Manage API tokens** → **Create API token**: izin **Object Read & Write**, kapsam sadece bu kova. Çıkan **Access Key ID** ile **Secret Access Key**'i ve R2 sayfasındaki **Account ID**'yi kopyala.
+3. Klip Kalkanı → **Gelişmiş ayarlar** → **Cloudflare R2 ve galeri**: kutuyu işaretle, bilgileri gir, **Bağlantıyı dene** → **Kaydet**. Galerin varsa adresini de yaz; Yedek > Galeriyi aç onu açar.
+
+Yeni klipler Telegram'dan hemen sonra R2'ye gider, Telegram'da zaten yedekli olanlar Telegram kuyruğu boşalınca (yeniden eskiye). Hız sınırı, oyun algılama ve duraklatma R2 için de geçerli; yarım kalan yükleme kaldığı yerden sürer.
+
+Kovadaki düzen (galeri gibi okuyan programlar için):
+
+- `klip/<oyun>/<yyyy-aa>/<dosya adı>`: klibin kendisi, orijinal dosya. Aynı adda başka bir klip varsa adın sonuna ` (<parmak izi>)` eklenir.
+- `kapak/<klibin adı>.jpg`: önizleme resmi.
+- Nesne bilgisi (`x-amz-meta-*`, Türkçe harfler %-kodlu): `oyun`, `ad` (dosya adı), `program`, `t` (çekildiği an, Unix), `tz` (o anki UTC farkı, dakika), `sure` (sn), `w`, `h`, `boyut`, `fp` (parmak izi).
+
 ## Gizlilik
 
 - Klipler sadece senin Telegram hesabındaki gizli gruba gider. Başka bir sunucu yok.
 - Telegram oturumu (`klip_kalkani.session`), ayarlar ve veritabanı sadece senin bilgisayarında (`%APPDATA%\KlipKalkani`) durur. Repoya hiçbir zaman girmez (`.gitignore` yalnızca program dosyalarına izin verir).
 - İnternet hızı ölçümü için Cloudflare'in hız testi adresine rastgele veri gönderilir. Kişisel veri gitmez.
+- Cloudflare R2 sadece açarsan kullanılır: klipler senin R2 kovana gider. Anahtarlar `%APPDATA%\KlipKalkani\ayarlar.json`'da durur.
 
 ## Geliştirici notları
 

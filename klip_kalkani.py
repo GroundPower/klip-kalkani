@@ -12,8 +12,12 @@ Komutlar (.venv\\Scripts\\python.exe klip_kalkani.py <komut>):
   yukle-dene DOSYA      Tek bir dosyayı hemen yükle (deneme için)
   cikis                 Telegram'dan çıkış yap (yedekleme durur; Telegram'daki yedekler kalır)
   kaldir                Otomatik başlatmayı kaldır
+  r2-dene               Cloudflare R2 ayarlarını dene (küçük bir dosya yazıp siler)
 
 Hiçbir komut bilgisayardaki klipleri silmez, taşımaz veya değiştirmez. Kanala sadece ekleme yapılır.
+
+İstenirse (Gelişmiş ayarlar > Cloudflare R2) Telegram'a yedeklenen her klip kendi Cloudflare R2 kovana da yüklenir
+(ikinci kopya; bir galeri sitesi oradan okuyabilir). Kovadaki düzen README'de.
 
 Ayarlar, Telegram girişi, veritabanı ve günlükler %APPDATA%\\KlipKalkani'de durur; program başka bir klasöre
 açılsa ya da güncellense de kaybolmaz. (1.7'den önce program klasöründeydi; ilk açılışta oraya taşınır.)
@@ -33,7 +37,9 @@ import fnmatch
 import getpass
 import glob
 import hashlib
+import hmac
 import html
+import http.client
 import io
 import json
 import logging
@@ -48,10 +54,11 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 
 import psutil
 
-VERSION = '1.11'
+VERSION = '1.12'
 BASE = os.path.dirname(os.path.abspath(__file__))  # program dosyaları
 APPDATA_DIR = os.path.join(os.environ.get('APPDATA') or os.path.join(os.path.expanduser('~'), 'AppData', 'Roaming'),
                            'KlipKalkani')
@@ -149,6 +156,14 @@ DEFAULT_CONFIG = {
     'ses_adlari': {},             # düzenleyicide ses kanalı adları: {orijinal ad: senin verdiğin ad}
     'kapatinca': 'sor',           # pencere kapatılınca: 'sor', 'arka_plan' (yedekleme sürer) ya da 'kapat' (hepsi kapanır)
     'tepsi_simgesi': True,        # arka plan çalışırken saatin yanında simge (aç / duraklat / tara / çıkış)
+    # Cloudflare R2: Telegram'a yüklenen kliplerin ikinci kopyası (galeri sitesi buradan okur).
+    # Anahtar: Cloudflare > R2 > Manage API tokens > Object Read & Write (sadece bu kova).
+    'r2_acik': False,
+    'r2_adres': '',               # hesap kimliği (Account ID) ya da https://<hesap>.r2.cloudflarestorage.com
+    'r2_kova': 'klipler',
+    'r2_anahtar': '',             # Access Key ID
+    'r2_gizli': '',               # Secret Access Key
+    'galeri_adresi': '',          # varsa R2'deki klipleri gösteren site (Yedek > Galeriyi aç)
 }
 
 # Oyun adı olmayan, sadece kapsayıcı klasör adları (oyun adı bu klasörlerin altından okunur)
@@ -230,6 +245,23 @@ CREATE TABLE IF NOT EXISTS topics (
     game TEXT PRIMARY KEY,
     topic_id INTEGER NOT NULL,
     created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS r2 (
+    fp TEXT PRIMARY KEY,
+    key TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    upload_id TEXT,
+    part_size INTEGER,
+    done_at REAL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_try REAL NOT NULL DEFAULT 0,
+    last_error TEXT
+);
+CREATE TABLE IF NOT EXISTS r2_parts (
+    fp TEXT NOT NULL,
+    no INTEGER NOT NULL,
+    etag TEXT NOT NULL,
+    PRIMARY KEY (fp, no)
 );
 """
 
@@ -418,6 +450,27 @@ def detect_game_date(path, mtime, pretty, rules=None):
     game = re.sub(r'\s+', ' ', game or folder_game or 'Diğer').strip()
     game = aliases.get(norm_key(game), game)
     return game, taken or mtime
+
+
+# Klibi kaydeden program (galerideki filtre için): önce dosya adı kalıbı, sonra klasör adları.
+PROGRAM_DIRS = (('Medal', {'medal'}), ('Outplayed', {'outplayed'}), ('Xbox Game Bar', {'captures'}),
+                ('AMD ReLive', {'radeon relive'}), ('NVIDIA', {'nvidia', 'shadowplay'}), ('OBS', {'obs', 'obs-studio'}))
+RE_OBS = re.compile(r'^\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2}\.\w+$')  # OBS'in varsayılan adı
+
+
+def detect_program(path):
+    name = os.path.basename(path)
+    if RE_MEDAL.search(name):
+        return 'Medal'
+    if RE_NVIDIA.match(name):
+        return 'NVIDIA'
+    if RE_OUTPLAYED.match(name):
+        return 'Outplayed'
+    dirs = {d.lower() for d in path.replace('/', os.sep).split(os.sep)[:-1]}
+    for label, names in PROGRAM_DIRS:
+        if dirs & names:
+            return label
+    return 'OBS' if RE_OBS.match(name) else 'Diğer'
 
 
 def fingerprint(path, size):
@@ -877,7 +930,8 @@ def status_line(s):
         total = s.get('dosya_boyut') or part
         done = (s.get('parca_ofset') or 0) + min(part, s.get('gonderilen') or 0)
         pct = f' %{min(100, 100 * done / total):.0f}' if total else ''
-        return f"yükleniyor{pct} · {os.path.basename(s['dosya'])}"
+        where = "R2'ye " if s.get('hedef') == 'r2' else ''
+        return f"{where}yükleniyor{pct} · {os.path.basename(s['dosya'])}"
     if d == 'duraklatildi':
         return s.get('sebep') or 'bekliyor'
     return STATE_TEXT.get(d, d or 'başlıyor')
@@ -937,7 +991,8 @@ class Gate:
         for key in ('hiz_plani', 'max_hiz_mbit', 'oyunda_dur', 'tam_ekranda_dur', 'oyun_exe',
                     'oyun_kapaninca_bekle_sn', 'uyku_engelle', 'paralel_parca', 'duraklat', 'bitince_duraklat',
                     'kaynaklar', 'yeni_klip_gun', 'tarama_dakika', 'uzantilar', 'genel_klasorler',
-                    'oyun_takma_adlari', 'oyun_konulari', 'otomatik_guncelle', 'kanal_adi'):
+                    'oyun_takma_adlari', 'oyun_konulari', 'otomatik_guncelle', 'kanal_adi', 'r2_acik', 'r2_adres',
+                    'r2_kova', 'r2_anahtar', 'r2_gizli', 'galeri_adresi'):
             self.cfg[key] = new.get(key)
         self.names = {n.lower() for n in self.cfg.get('oyun_exe') or []}
         log.info('Ayarlar değişti, yeniden yüklendi')
@@ -1151,7 +1206,8 @@ async def upload_blob(ctx, row, fp, st, deadline):
     db.commit()
     have = {r['idx'] for r in db.execute('SELECT idx FROM parts WHERE fp=?', (fp,))}
     base = os.path.basename(row['path'])
-    ctx.status.update(force=True, durum='hazirlaniyor', sebep=None, dosya=row['path'], oyun=row['game'] or 'Diğer')
+    ctx.status.update(force=True, durum='hazirlaniyor', hedef=None, sebep=None, dosya=row['path'],
+                      oyun=row['game'] or 'Diğer')
     video = await asyncio.to_thread(probe_video, row['path'])
     # Tek parça ve mp4/mov ise Telegram'da oynatılan video olarak gider; parçalılar dosya + önizleme resmi.
     as_video = bool(nparts == 1 and video and video['w'] and video['h']
@@ -1271,6 +1327,432 @@ async def verify(ctx, fix=True, progress=None):
         log.info('Doğrulama: %s parçanın hepsi kanalda duruyor', fmt_count(len(rows)))
     meta_set(db, 'son_dogrulama', time.time())
     return len(rows), len(bad)
+
+
+# ---------------------------------------------------------------- Cloudflare R2 (isteğe bağlı ikinci kopya)
+
+R2_PREFIX = 'klip/'             # klipler: klip/<oyun>/<yyyy-aa>/<dosya adı>
+R2_THUMB_PREFIX = 'kapak/'      # önizleme resimleri: kapak/<klibin anahtarı>.jpg
+R2_SINGLE = 64 * 1024 * 1024    # bunun altı tek istekle gider
+R2_PART = 32 * 1024 * 1024      # çok parçalı yüklemede parça boyu (R2: sonuncusu hariç hepsi aynı boyda olmalı)
+R2_MAX_PARTS = 10000
+R2_SLICE = 256 * 1024           # hız sınırına uymak için gövde bu dilimlerle gönderilir
+R2_PARALLEL = 3                 # aynı anda giden parça
+R2_TEST_KEY = '.klip-kalkani-deneme'
+
+
+class R2Error(Exception):
+    def __init__(self, status, code, message=''):
+        super().__init__(f'R2 {status} {code}' + (f': {message}' if message else ''))
+        self.status = status
+        self.code = code
+
+    @property
+    def retryable(self):
+        return self.status >= 500 or self.status in (408, 429)
+
+    @property
+    def auth(self):
+        return self.status in (401, 403)
+
+
+def r2_enabled(cfg):
+    return bool(cfg.get('r2_acik') and cfg.get('r2_adres') and cfg.get('r2_anahtar') and cfg.get('r2_gizli'))
+
+
+class R2:
+    """Cloudflare R2'ye (S3 uyumlu API) AWS imza sürüm 4 ile imzalı istekler; ek paket gerektirmez.
+    r2_adres: hesap kimliği ya da https://<hesap>.r2.cloudflarestorage.com (sonunda /kova da olabilir)."""
+
+    def __init__(self, cfg):
+        adres = (cfg.get('r2_adres') or '').strip()
+        bucket = (cfg.get('r2_kova') or '').strip().strip('/')
+        if adres and '://' not in adres:
+            adres = 'https://' + (adres if '.' in adres else f'{adres}.r2.cloudflarestorage.com')
+        u = urllib.parse.urlsplit(adres)
+        self.secure = u.scheme != 'http'
+        self.host = u.netloc
+        self.bucket = bucket or u.path.strip('/').split('/')[0]
+        self.key_id = (cfg.get('r2_anahtar') or '').strip()
+        self.secret = (cfg.get('r2_gizli') or '').strip()
+        if not (self.host and self.bucket and self.key_id and self.secret):
+            raise ValueError('R2 ayarları eksik: hesap kimliği, kova adı, erişim anahtarı ve gizli anahtar gerekli')
+
+    @property
+    def target(self):
+        return f'{self.host}/{self.bucket}'
+
+    @staticmethod
+    def _query(query):
+        q = lambda s: urllib.parse.quote(str(s), safe='-_.~')  # noqa: E731
+        return '&'.join(f'{q(k)}={q(v)}' for k, v in sorted(query.items()))
+
+    def sign(self, method, path, query, headers, payload_hash, now=None):
+        """İmzalı başlıklar (host ve x-amz-* dahil). path: /kova/anahtar (kodlanmamış)."""
+        stamp = (now or dt.datetime.now(dt.timezone.utc)).strftime('%Y%m%dT%H%M%SZ')
+        day = stamp[:8]
+        h = {k.lower(): ' '.join(str(v).split()) for k, v in headers.items()}
+        h.update({'host': self.host, 'x-amz-date': stamp, 'x-amz-content-sha256': payload_hash})
+        names = sorted(h)
+        canon = '\n'.join([method, urllib.parse.quote(path, safe='/-_.~'), self._query(query),
+                           ''.join(f'{n}:{h[n]}\n' for n in names), ';'.join(names), payload_hash])
+        scope = f'{day}/auto/s3/aws4_request'
+        to_sign = '\n'.join(['AWS4-HMAC-SHA256', stamp, scope, hashlib.sha256(canon.encode()).hexdigest()])
+        k = ('AWS4' + self.secret).encode()
+        for part in (day, 'auto', 's3', 'aws4_request'):
+            k = hmac.new(k, part.encode(), hashlib.sha256).digest()
+        sig = hmac.new(k, to_sign.encode(), hashlib.sha256).hexdigest()
+        h['authorization'] = (f'AWS4-HMAC-SHA256 Credential={self.key_id}/{scope}, '
+                              f'SignedHeaders={";".join(names)}, Signature={sig}')
+        return h
+
+    def request(self, method, key='', query=None, headers=None, body=b'', before=None, after=None, timeout=120):
+        """before(n) / after(n): gövdenin her diliminden önce (hız sınırı) ve sonra (ilerleme) çağrılır."""
+        query = query or {}
+        path = f'/{self.bucket}/{key}' if key else f'/{self.bucket}'
+        h = self.sign(method, path, query, headers or {}, hashlib.sha256(body).hexdigest())
+        url = urllib.parse.quote(path, safe='/-_.~') + ('?' + self._query(query) if query else '')
+        conn = (http.client.HTTPSConnection if self.secure else http.client.HTTPConnection)(self.host, timeout=timeout)
+        try:
+            conn.putrequest(method, url, skip_host=True, skip_accept_encoding=True)
+            for k, v in h.items():
+                conn.putheader(k, v)
+            if body or method in ('PUT', 'POST'):
+                conn.putheader('content-length', str(len(body)))
+            conn.endheaders()
+            view = memoryview(body)
+            for i in range(0, len(body), R2_SLICE):
+                piece = view[i:i + R2_SLICE]
+                if before:
+                    before(len(piece))
+                conn.send(piece)
+                if after:
+                    after(len(piece))
+            resp = conn.getresponse()
+            data = resp.read()
+        finally:
+            conn.close()
+        if resp.status >= 300 or (method == 'POST' and b'<Error>' in data[:200]):  # tamamlama 200 ile hata dönebilir
+            code = re.search(rb'<Code>(.*?)</Code>', data)
+            msg = re.search(rb'<Message>(.*?)</Message>', data)
+            raise R2Error(resp.status if resp.status >= 300 else 500,
+                          code.group(1).decode('utf-8', 'replace') if code else resp.reason,
+                          html.unescape(msg.group(1).decode('utf-8', 'replace')) if msg else '')
+        return resp, data
+
+    def head(self, key):
+        """Nesnenin başlıkları (küçük harfli), yoksa None."""
+        try:
+            resp, _ = self.request('HEAD', key)
+        except R2Error as e:
+            if e.status == 404:
+                return None
+            raise
+        return {k.lower(): v for k, v in resp.getheaders()}
+
+    def put(self, key, body, headers=None, **kw):
+        self.request('PUT', key, headers=headers, body=body, **kw)
+
+    def delete(self, key):
+        self.request('DELETE', key)
+
+    def create_multipart(self, key, headers):
+        _, data = self.request('POST', key, {'uploads': ''}, headers)
+        m = re.search(rb'<UploadId>(.*?)</UploadId>', data)
+        if not m:
+            raise R2Error(500, 'UploadId', 'çok parçalı yükleme başlatılamadı')
+        return html.unescape(m.group(1).decode())
+
+    def upload_part(self, key, upload_id, no, body, **kw):
+        resp, _ = self.request('PUT', key, {'partNumber': no, 'uploadId': upload_id}, body=body, **kw)
+        etag = resp.getheader('ETag')
+        if not etag:
+            raise R2Error(500, 'ETag', f'parça {no} için ETag gelmedi')
+        return etag
+
+    def complete_multipart(self, key, upload_id, etags):
+        xml = ''.join(f'<Part><PartNumber>{n}</PartNumber><ETag>{html.escape(e)}</ETag></Part>'
+                      for n, e in sorted(etags.items()))
+        self.request('POST', key, {'uploadId': upload_id}, {'content-type': 'application/xml'},
+                     f'<CompleteMultipartUpload>{xml}</CompleteMultipartUpload>'.encode())
+
+    def abort_multipart(self, key, upload_id):
+        self.request('DELETE', key, {'uploadId': upload_id})
+
+
+def r2_retry(fn, tries=5):
+    """Geçici ağ/sunucu hatalarında birkaç kez tekrar dener (iş parçacığında çalışır)."""
+    for i in range(tries):
+        try:
+            return fn()
+        except R2Error as e:
+            if not e.retryable or i == tries - 1:
+                raise
+        except (OSError, http.client.HTTPException):
+            if i == tries - 1:
+                raise
+        time.sleep(min(60, 2 ** (i + 1)))
+
+
+def r2_error_text(e):
+    """R2 hatasının ayarlarda ne düzeltilmesi gerektiğini söyleyen açıklaması."""
+    if isinstance(e, R2Error):
+        text = {'InvalidAccessKeyId': 'Erişim anahtarı (Access Key ID) yanlış.',
+                'SignatureDoesNotMatch': 'Gizli anahtar (Secret Access Key) yanlış.',
+                'NoSuchBucket': 'Bu adda bir kova yok; Cloudflare > R2\'de kovanın adını kontrol et.',
+                'AccessDenied': 'Anahtarın bu kovaya yazma izni yok (Object Read & Write olmalı).',
+                'Unauthorized': 'Anahtar reddedildi; erişim anahtarı ve gizli anahtarı kontrol et.'}.get(e.code)
+        return f'{text} ({e})' if text else str(e)
+    if isinstance(e, OSError):
+        return f"R2'ye ulaşılamadı (hesap kimliği ya da internet): {e}"
+    return str(e)
+
+
+def r2_test(cfg):
+    """Ayarları küçük bir deneme dosyası yazıp silerek dener; sorun varsa anlaşılır bir RuntimeError."""
+    try:
+        r2 = R2(cfg)
+        r2.put(R2_TEST_KEY, b'Klip Kalkani baglanti denemesi', {'content-type': 'text/plain'})
+        r2.delete(R2_TEST_KEY)
+    except (ValueError, R2Error, OSError, http.client.HTTPException) as e:
+        raise RuntimeError(r2_error_text(e)) from e
+    return r2.target
+
+
+def r2_key(row, fp=None):
+    """Klibin R2'deki adı: klip/<oyun>/<yyyy-aa>/<dosya adı>. fp verilirse adın sonuna eklenir (aynı adda başka klip)."""
+    when = dt.datetime.fromtimestamp(row['taken'] or row['mtime'])
+    base = os.path.basename(row['path'])
+    if fp:
+        stem, ext = os.path.splitext(base)
+        base = f'{stem} ({fp[:8]}){ext}'
+    return f'{R2_PREFIX}{safe_name(row["game"] or "Diğer")}/{when:%Y-%m}/{base}'
+
+
+def r2_headers(row, fp, size, video):
+    """Galerinin okuduğu bilgiler (x-amz-meta-*: sadece ASCII, Türkçe harfler %-kodlu; tz: UTC farkı, dakika)."""
+    name = os.path.basename(row['path'])
+    taken = row['taken'] or row['mtime']
+    tz = dt.datetime.fromtimestamp(taken).astimezone().utcoffset()  # galeri saati bu bilgisayardaki gibi göstersin
+    q = lambda s: urllib.parse.quote(s, safe='')  # noqa: E731
+    h = {'content-type': mimetypes.guess_type(name)[0] or 'application/octet-stream',
+         'x-amz-meta-fp': fp, 'x-amz-meta-boyut': str(size), 'x-amz-meta-t': str(int(taken)),
+         'x-amz-meta-tz': str(int(tz.total_seconds() // 60)) if tz is not None else '0',
+         'x-amz-meta-oyun': q(row['game'] or 'Diğer'), 'x-amz-meta-ad': q(name),
+         'x-amz-meta-program': q(detect_program(row['path']))}
+    if video:
+        h.update({'x-amz-meta-sure': f'{video["duration"]:.1f}', 'x-amz-meta-w': str(video['w']),
+                  'x-amz-meta-h': str(video['h'])})
+    return h
+
+
+def r2_for(ctx):
+    """Ayarlara göre R2 bağlantısı (ayarlar değişince yenisi kurulur); kapalı ya da eksikse None."""
+    cfg = ctx.cfg
+    if not r2_enabled(cfg):
+        return None
+    sig = tuple(cfg.get(k) for k in ('r2_adres', 'r2_kova', 'r2_anahtar', 'r2_gizli'))
+    if getattr(ctx, 'r2_sig', None) != sig:
+        ctx.r2_sig = sig
+        try:
+            ctx.r2 = R2(cfg)
+        except ValueError as e:
+            log.warning('R2 kapalı: %s', e)
+            ctx.r2 = None
+        else:
+            if meta_get(ctx.db, 'r2_hedef') != ctx.r2.target:  # başka hesap/kova: kayıtlar sıfırlanır,
+                with ctx.db:                                   # orada zaten olanlar yüklenmeden tanınır
+                    ctx.db.execute('DELETE FROM r2')
+                    ctx.db.execute('DELETE FROM r2_parts')
+                meta_set(ctx.db, 'r2_hedef', ctx.r2.target)
+            log.info('R2 açık: %s', ctx.r2.target)
+    return ctx.r2
+
+
+def r2_queue(db, since):
+    """Telegram'a yedeklenmiş ama R2'de olmayan klipler; galeride önce yeniler görünsün diye yeniden eskiye."""
+    rows = db.execute(
+        'SELECT f.path, f.size, f.mtime, f.fp, f.game, f.taken FROM files f '
+        "JOIN blobs b ON b.fp = f.fp AND b.status = 'done' LEFT JOIN r2 ON r2.fp = f.fp "
+        "WHERE f.seen >= ? AND f.size > 0 AND (r2.status IS NULL OR (r2.status != 'done' AND r2.next_try <= ?)) "
+        'ORDER BY COALESCE(f.taken, f.mtime) DESC', (since, time.time())).fetchall()
+    seen = set()
+    return [r for r in rows if not (r['fp'] in seen or seen.add(r['fp']))]
+
+
+def _read_range(path, offset, length):
+    with open(path, 'rb') as f:
+        f.seek(offset)
+        data = f.read(length)
+    if len(data) != length:
+        raise FileChanged(path)
+    return data
+
+
+def _r2_done(db, fp, key):
+    db.execute("UPDATE r2 SET status='done', key=?, upload_id=NULL, done_at=?, attempts=0, next_try=0, "
+               'last_error=NULL WHERE fp=?', (key, time.time(), fp))
+    db.execute('DELETE FROM r2_parts WHERE fp=?', (fp,))
+    db.commit()
+
+
+async def r2_upload(ctx, row, fp, st):
+    db, r2, path, size = ctx.db, ctx.r2, row['path'], st.st_size
+    game = row['game'] or 'Diğer'
+    ctx.status.update(force=True, durum='hazirlaniyor', hedef='r2', sebep=None, dosya=path, oyun=game)
+    rec = db.execute('SELECT * FROM r2 WHERE fp=?', (fp,)).fetchone()
+    key = rec['key']
+    if not (key and rec['upload_id']):
+        key = r2_key(row)
+        found = await asyncio.to_thread(r2_retry, lambda: r2.head(key))
+        if found and found.get('x-amz-meta-fp') != fp:  # aynı adda başka bir klip var
+            key = r2_key(row, fp)
+            found = await asyncio.to_thread(r2_retry, lambda: r2.head(key))
+        if found and found.get('x-amz-meta-fp') == fp and found.get('content-length') == str(size):
+            _r2_done(db, fp, key)  # başka bir bilgisayardan ya da önceki kurulumdan zaten yüklenmiş
+            log.info("R2'de zaten var: %s", key)
+            return 'dup'
+        db.execute('UPDATE r2 SET key=?, upload_id=NULL WHERE fp=?', (key, fp))
+        db.execute('DELETE FROM r2_parts WHERE fp=?', (fp,))
+        db.commit()
+        rec = db.execute('SELECT * FROM r2 WHERE fp=?', (fp,)).fetchone()
+    video = await asyncio.to_thread(probe_video, path)
+    headers = r2_headers(row, fp, size, video)
+    loop = asyncio.get_running_loop()
+
+    def before(n):  # iş parçacığından: oyun açıkken / saat planında bekler, hızı sınırlar
+        asyncio.run_coroutine_threadsafe(ctx.gate.wait(n), loop).result()
+
+    t0 = time.time()
+    paused0 = ctx.gate.paused_total
+    if size <= R2_SINGLE:
+        ctx.status.update(force=True, parca='1/1', parca_boyut=size, parca_ofset=0, dosya_boyut=size, gonderilen=0)
+        await ctx.gate.wait(0)
+        data = await asyncio.to_thread(_read_range, path, 0, size)
+        check_unchanged(path, st)
+        await asyncio.to_thread(r2_retry, lambda: r2.put(key, data, headers, before=before, after=ctx.status.add_bytes))
+    else:
+        upload_id = rec['upload_id']  # varsa önceki çalışmadan yarım kalan yükleme sürer
+        part = rec['part_size'] if upload_id else max(R2_PART, -(-size // R2_MAX_PARTS // 2 ** 20) * 2 ** 20)
+        if not upload_id:
+            upload_id = await asyncio.to_thread(r2_retry, lambda: r2.create_multipart(key, headers))
+            db.execute('UPDATE r2 SET upload_id=?, part_size=? WHERE fp=?', (upload_id, part, fp))
+            db.commit()
+        etags = {r['no']: r['etag'] for r in db.execute('SELECT no, etag FROM r2_parts WHERE fp=?', (fp,))}
+        nparts = -(-size // part)
+        have = sum(min(part, size - (n - 1) * part) for n in etags)
+        ctx.status.update(force=True, parca='1/1', parca_boyut=size - have, parca_ofset=have, dosya_boyut=size,
+                          gonderilen=0)
+        sem = asyncio.Semaphore(R2_PARALLEL)
+        failure = []
+
+        async def one(no):
+            async with sem:
+                if failure:  # bir parça hata verdi: yenisine başlanmaz, gönderilmekte olanlar bitip kaydedilir
+                    return
+                try:
+                    await ctx.gate.wait(0)
+                    offset = (no - 1) * part
+                    data = await asyncio.to_thread(_read_range, path, offset, min(part, size - offset))
+                    etags[no] = await asyncio.to_thread(r2_retry, lambda: r2.upload_part(
+                        key, upload_id, no, data, before=before, after=ctx.status.add_bytes))
+                except Exception as e:
+                    failure.append(e)
+                    return
+                db.execute('INSERT OR REPLACE INTO r2_parts(fp, no, etag) VALUES (?, ?, ?)', (fp, no, etags[no]))
+                db.commit()
+
+        tasks = [asyncio.ensure_future(one(n)) for n in range(1, nparts + 1) if n not in etags]
+        try:
+            await asyncio.gather(*tasks)
+            if failure:
+                raise failure[0]
+            check_unchanged(path, st)
+            await asyncio.to_thread(r2_retry, lambda: r2.complete_multipart(key, upload_id, etags))
+        except R2Error as e:
+            if e.code == 'NoSuchUpload':  # yarım yükleme R2'de silinmiş (bir hafta bekleyince olur): baştan
+                db.execute('UPDATE r2 SET upload_id=NULL WHERE fp=?', (fp,))
+                db.execute('DELETE FROM r2_parts WHERE fp=?', (fp,))
+                db.commit()
+            raise
+        finally:
+            for t in tasks:
+                t.cancel()
+    if video and video.get('thumb'):
+        try:
+            await asyncio.to_thread(r2_retry, lambda: r2.put(R2_THUMB_PREFIX + key + '.jpg', video['thumb'],
+                                                             {'content-type': 'image/jpeg'}))
+        except Exception as e:  # önizleme resmi olmasa da klip yedekli
+            log.info("R2'ye önizleme resmi yüklenemedi: %s (%s)", key, e)
+    _r2_done(db, fp, key)
+    active = max(1.0, time.time() - t0 - (ctx.gate.paused_total - paused0))
+    log.info("R2'ye yüklendi: %s (%s, %s, %s/sn)", key, fmt_size(size), fmt_duration(active), fmt_size(size / active))
+    return 'done'
+
+
+async def r2_process(ctx, row):
+    """Klibi R2'ye yükler (zaten orada değilse). Hata Telegram yedeğini durdurmaz: kaydedilir, sonra tekrar denenir."""
+    db, fp, path = ctx.db, row['fp'], row['path']
+    if not fp or r2_for(ctx) is None:
+        return 'skip'
+    if time.time() < getattr(ctx, 'r2_wait', 0):  # son deneme hata verdi (ağ, anahtar…): Telegram'ı yavaşlatmasın
+        return 'later'
+    rec = db.execute('SELECT * FROM r2 WHERE fp=?', (fp,)).fetchone()
+    if rec and rec['status'] == 'done':
+        return 'dup'
+    if rec and rec['next_try'] > time.time():
+        return 'later'
+    try:
+        st = os.stat(path)
+    except OSError:
+        return 'missing'
+    if st.st_size != row['size'] or st.st_mtime != row['mtime']:
+        return 'changed'
+    db.execute('INSERT OR IGNORE INTO r2(fp) VALUES (?)', (fp,))
+    db.commit()
+    try:
+        result = await r2_upload(ctx, row, fp, st)
+        ctx.r2_fails = 0
+        return result
+    except asyncio.CancelledError:
+        raise
+    except FileChanged:
+        log.info('Dosya R2\'ye yüklenirken değişti, sonra tekrar denenecek: %s', path)
+        rec = db.execute('SELECT key, upload_id FROM r2 WHERE fp=?', (fp,)).fetchone()
+        if rec and rec['upload_id']:
+            try:
+                await asyncio.to_thread(ctx.r2.abort_multipart, rec['key'], rec['upload_id'])
+            except Exception:
+                pass
+        db.execute('UPDATE r2 SET upload_id=NULL WHERE fp=?', (fp,))
+        db.execute('DELETE FROM r2_parts WHERE fp=?', (fp,))
+        db.commit()
+        return 'changed'
+    except Exception as e:
+        attempts = (rec['attempts'] if rec else 0) + 1
+        delay = min(6 * 3600, 60 * 3 ** min(attempts - 1, 6))
+        err = r2_error_text(e)[:500]
+        db.execute('UPDATE r2 SET attempts=?, next_try=?, last_error=? WHERE fp=?',
+                   (attempts, time.time() + delay, err, fp))
+        if attempts % 3 == 0:  # yarım kalan yükleme üst üste bozuluyor: bir dahakine baştan başlansın
+            db.execute('UPDATE r2 SET upload_id=NULL WHERE fp=?', (fp,))
+            db.execute('DELETE FROM r2_parts WHERE fp=?', (fp,))
+        db.commit()
+        log.warning("R2'ye yüklenemedi (%d. deneme, %s sonra tekrar): %s: %s", attempts, fmt_duration(delay), path, err)
+        ctx.r2_fails = getattr(ctx, 'r2_fails', 0) + 1  # üst üste hatada R2 bir süre hiç denenmez (1 dk … 1 saat)
+        ctx.r2_wait = time.time() + min(3600, 60 * 2 ** (ctx.r2_fails - 1))
+        if isinstance(e, R2Error) and e.auth:
+            alert(db, 'r2_yetki', "Klip Kalkanı: R2'ye yüklenemiyor",
+                  "Cloudflare R2 anahtarı reddedildi. Gelişmiş ayarlar > Cloudflare R2'yi kontrol et.", 24)
+        return 'error'
+
+
+def r2_summary(db):
+    """(R2'de duran klip sayısı, boyutu, sorunlu klip sayısı)"""
+    n, size = db.execute("SELECT COUNT(*), COALESCE(SUM(b.size), 0) FROM r2 JOIN blobs b ON b.fp = r2.fp "
+                         "WHERE r2.status = 'done'").fetchone()
+    bad = db.execute("SELECT COUNT(*) FROM r2 WHERE status != 'done' AND attempts > 0").fetchone()[0]
+    return n, size, bad
 
 
 # ---------------------------------------------------------------- kurulum yardımcıları
@@ -2619,11 +3101,13 @@ async def cmd_run(cfg, limit=None):
 async def upload_loop(client, cfg, db, status, limit, started):
     me = await client.get_me()
     ctx = Ctx(client=client, cfg=cfg, db=db, status=status, premium=bool(getattr(me, 'premium', False)),
-              channel=channel_peer(cfg), started=started, next_update_check=time.time() + 120)
+              channel=channel_peer(cfg), started=started, next_update_check=time.time() + 120, r2=None, r2_sig=None,
+              r2q_sig=None)
     ctx.gate = Gate(cfg, status)
     log.info('Bağlandı: %s (Premium: %s)', me.first_name, 'evet' if ctx.premium else 'hayır')
     next_scan = 0.0
     queue = []
+    r2q = []  # Telegram'a yedeklenmiş, R2'ye gidecek klipler (Telegram kuyruğu boşalınca)
     done = 0
     worked = False
 
@@ -2649,6 +3133,8 @@ async def upload_loop(client, cfg, db, status, limit, started):
                 status.update(force=True, durum='taraniyor', sebep=None)
             st = await asyncio.to_thread(scan, cfg)
             queue = build_queue(db, cfg, st['start'])
+            r2q = r2_queue(db, st['start']) if r2_for(ctx) else []
+            ctx.r2q_sig = getattr(ctx, 'r2_sig', None)
             next_scan = time.time() + cfg['tarama_dakika'] * 60
             if st['new'] or st['changed']:
                 log.info('Tarama: %d yeni, %d değişmiş dosya; kuyrukta %d klip', st['new'], st['changed'], len(queue))
@@ -2660,6 +3146,9 @@ async def upload_loop(client, cfg, db, status, limit, started):
                           'Şu klasörler bir haftadır yok: ' + ', '.join(st['unavailable'][:3]), 7 * 24)
             else:
                 meta_set(db, 'erisilemez_baslangic', None)
+        if r2_for(ctx) and ctx.r2q_sig != ctx.r2_sig:  # R2 ayarlardan yeni açıldı ya da değişti
+            ctx.r2q_sig = ctx.r2_sig
+            r2q = r2_queue(db, meta_get(db, 'son_tarama') or 0)
         if now >= (meta_get(db, 'son_dogrulama') or 0) + 7 * 86400 and db.execute(
                 'SELECT 1 FROM parts LIMIT 1').fetchone():
             await verify(ctx)
@@ -2689,9 +3178,13 @@ async def upload_loop(client, cfg, db, status, limit, started):
             status.update(force=first, durum='duraklatildi', sebep='elle duraklatıldı', dosya=None)
             await asyncio.sleep(3)
             continue
+        if not queue and r2q and r2_for(ctx):  # Telegram'da her şey yedekli: R2'ye eksik kalanlar
+            await r2_process(ctx, r2q.pop(0))
+            pause_if_requested()
+            continue
         if not queue:
             keep_awake(False)
-            status.update(force=True, durum='hazir', dosya=None, sebep=None)
+            status.update(force=True, durum='hazir', dosya=None, sebep=None, hedef=None)
             if worked and not meta_get(db, 'ilk_yedek_bitti'):
                 meta_set(db, 'ilk_yedek_bitti', time.time())
                 try:
@@ -2710,6 +3203,12 @@ async def upload_loop(client, cfg, db, status, limit, started):
                 continue  # parçalı klip: "bitince duraklat" istendi, araya başka klip girmeden bitsin
             break
         pause_if_requested()
+        if result == 'done' and r2_for(ctx) and not ctx.gate.manually_paused():  # yeni klip galeriye de hemen gitsin
+            fresh = db.execute('SELECT path, size, mtime, fp, game, taken FROM files WHERE path=?',
+                               (row['path'],)).fetchone()
+            if fresh:
+                await r2_process(ctx, fresh)
+                pause_if_requested()
         if result == 'done':
             done += 1
             worked = True
@@ -2741,6 +3240,10 @@ async def cmd_try(cfg, path):
         row['mtime'] = st.st_mtime
         result = await process_item(ctx, row, time.time() + 86400)
         print('Sonuç:', {'done': 'yüklendi', 'dup': 'zaten yedekli'}.get(result, result))
+        if result in ('done', 'dup') and r2_for(ctx):
+            fresh = db.execute('SELECT path, size, mtime, fp, game, taken FROM files WHERE path=?', (path,)).fetchone()
+            result = await r2_process(ctx, fresh)
+            print('R2:', {'done': 'yüklendi', 'dup': 'zaten var'}.get(result, result))
     finally:
         keep_awake(False)
         await client.disconnect()
@@ -2849,6 +3352,9 @@ def cmd_status(cfg):
     ver = meta_get(db, 'son_dogrulama')
     if ver:
         print(f'Son kontrol: {fmt_duration(time.time() - ver)} önce (kanaldaki yedekler yerinde)')
+    if r2_enabled(cfg):
+        n, size, bad = r2_summary(db)
+        print(f'R2:          {fmt_count(n)} klip, {fmt_size(size)}' + (f' ({bad} klip tekrar denenecek)' if bad else ''))
 
 
 async def collect_channel(client, peer):
@@ -3084,6 +3590,7 @@ def main():
     p.add_argument('dosya')
     sub.add_parser('kaldir')
     sub.add_parser('cikis')
+    sub.add_parser('r2-dene')
     args = ap.parse_args()
 
     if args.komut == 'calis':
@@ -3130,6 +3637,8 @@ def main():
             cmd_uninstall()
         elif args.komut == 'cikis':
             asyncio.run(cmd_logout())
+        elif args.komut == 'r2-dene':
+            print(f'R2 bağlantısı tamam: {r2_test(cfg)}')
     except NotLoggedIn as e:
         print(f'Önce giriş yapman lazım ({e}): Klip Kalkanı penceresini aç.')
         sys.exit(2)

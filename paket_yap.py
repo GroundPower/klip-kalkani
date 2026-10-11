@@ -46,6 +46,8 @@ NE YAPAR
   Ses kanalları (tüm ses / oyun / Discord / mikrofon): aç/kapat, seviye, tek dinle; kaydederken hepsini tek
   kanalda birleştir (Discord'da ve telefonda her şey duyulsun) ya da ayrı kanallar olarak kaydet.
 - Hiçbir dosyayı silmez, taşımaz. Aynı klip iki kere yüklenmez.
+- İstersen (Gelişmiş ayarlar > Cloudflare R2 ve galeri) klipler kendi Cloudflare R2 kovana da yüklenir (ikinci
+  kopya). Kurulum: GitHub sayfasındaki README, "Cloudflare R2" bölümü.
 
 ARKA PLAN VE KAPATMA
 - Yedekleme pencereden bağımsız, arka planda çalışır; o sırada saatin yanında Klip Kalkanı simgesi durur

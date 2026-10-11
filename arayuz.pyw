@@ -794,6 +794,9 @@ class App(tk.Tk):
         self.item(m, "Arşiv grubunu Telegram'da aç", 'send', lambda: self._on_dashboard('open_telegram'), enabled=tg)
         self.item(m, 'Klipleri geri yükle…', 'download', lambda: self._select_tab('restore'), enabled=tg)
         self.item(m, 'Klip düzenle…', 'edit', lambda: self._select_tab('edit'), enabled=dash)
+        galeri = kk.load_config().get('galeri_adresi')
+        m.add_separator()
+        self.item(m, 'Galeriyi aç (tarayıcıda)', 'cloud', lambda: webbrowser.open(galeri), enabled=bool(galeri))
 
     def _fill_account(self, m):
         dash, local = self._modes()
@@ -1810,8 +1813,8 @@ class DashboardView(ttk.Frame):
                 self._set_state(GREY, 'Başlıyor…', 'Arka plan birkaç saniye içinde açılır.')
             self._set_current(None, s)
         elif d == 'yukleniyor':
-            self._set_state(GREEN, 'Yükleniyor', f'Hız sınırı şu an: {self._limit_text(cfg)}. '
-                                                 'Oyun açılınca kendiliğinden durur.' + note)
+            self._set_state(GREEN, "Cloudflare R2'ye yükleniyor" if s.get('hedef') == 'r2' else 'Yükleniyor',
+                            f'Hız sınırı şu an: {self._limit_text(cfg)}. Oyun açılınca kendiliğinden durur.' + note)
             self._set_current(s.get('dosya'), s)
         elif d == 'duraklatildi':
             sebep = s.get('sebep') or ''
@@ -2710,9 +2713,9 @@ class AdvancedSettings(tk.Toplevel):
         self._row(box, label, ttk.Spinbox(box, from_=lo, to=hi, textvariable=var, width=8), hint)
         self.fields[key] = (lambda: _int(var.get(), lo, hi, label), lambda v: var.set(str(v)))
 
-    def text(self, box, key, label, value, hint=None, width=36):
+    def text(self, box, key, label, value, hint=None, width=36, secret=False):
         var = tk.StringVar(value=value or '')
-        self._row(box, label, ttk.Entry(box, textvariable=var, width=width), hint)
+        self._row(box, label, ttk.Entry(box, textvariable=var, width=width, show='•' if secret else ''), hint)
         self.fields[key] = (lambda: var.get().strip(), lambda v: var.set(v or ''))
 
     def lines(self, box, key, label, value, hint=None, height=4, as_dict=False):
@@ -2803,6 +2806,27 @@ class AdvancedSettings(tk.Toplevel):
         self.text(box, 'kanal_adi', 'Yeni arşiv grubunun adı:', cfg.get('kanal_adi'),
                   'Sadece yeni bir grup açılırsa kullanılır; var olan grubun adı Telegram\'dan değişir.', width=30)
 
+        box = self.section('Cloudflare R2 ve galeri',
+                           "İstersen Telegram'a yüklenen her klip kendi Cloudflare R2 kovana da yüklenir (ikinci "
+                           'kopya); bir galeri sitesi klipleri oradan gösterebilir. R2 kullandıkça ücretlidir (ilk 10 GB '
+                           'bedava). Kurulum: programın GitHub sayfasındaki README, "Cloudflare R2" bölümü.')
+        self.check(box, 'r2_acik', "Klipleri Cloudflare R2'ye de yükle", cfg.get('r2_acik'))
+        self.text(box, 'r2_adres', 'Hesap kimliği:', cfg.get('r2_adres'),
+                  'Cloudflare > R2 sayfasında sağdaki Account ID (ya da S3 API adresinin tamamı).', width=46)
+        self.text(box, 'r2_kova', 'Kova (bucket):', cfg.get('r2_kova'), width=24)
+        self.text(box, 'r2_anahtar', 'Erişim anahtarı:', cfg.get('r2_anahtar'),
+                  'R2 > Manage API tokens > Create API token > "Object Read & Write", sadece bu kova. Çıkan '
+                  'Access Key ID buraya, Secret Access Key alttakine.', width=46)
+        self.text(box, 'r2_gizli', 'Gizli anahtar:', cfg.get('r2_gizli'), width=46, secret=True)
+        self.text(box, 'galeri_adresi', 'Galeri adresi:', cfg.get('galeri_adresi'),
+                  'Varsa R2\'deki klipleri gösteren sitenin adresi; Yedek menüsündeki "Galeriyi aç" bunu açar.', width=46)
+        r = ttk.Frame(box)
+        self.r2_btn = ttk.Button(r, text='Bağlantıyı dene', command=self.test_r2)
+        self.r2_btn.pack(side='left')
+        self.r2_msg = ttk.Label(r, text='', style='Muted.TLabel', wraplength=480, justify='left')
+        self.r2_msg.pack(side='left', padx=10)
+        self._row(box, '', r)
+
         box = self.section('Düzenleyici')
         self.lines(box, 'ses_adlari', 'Ses kanalı adları:', cfg.get('ses_adlari'),
                    'Her satıra "orijinal ad = senin verdiğin ad" (ör. r5apex_dx12 = Apex). Düzenle sekmesinde ✎ ile de '
@@ -2845,6 +2869,11 @@ class AdvancedSettings(tk.Toplevel):
         if not out['uzantilar']:
             raise ValueError('"Video uzantıları": en az bir uzantı yaz.')
         out['kanal_adi'] = out['kanal_adi'] or kk.DEFAULT_CONFIG['kanal_adi']
+        out['r2_kova'] = out['r2_kova'] or kk.DEFAULT_CONFIG['r2_kova']
+        g = out['galeri_adresi'].rstrip('/')
+        out['galeri_adresi'] = g if not g or '://' in g else 'https://' + g
+        if out['r2_acik'] and not (out['r2_adres'] and out['r2_anahtar'] and out['r2_gizli']):
+            raise ValueError('"Cloudflare R2": hesap kimliği, erişim anahtarı ve gizli anahtarın üçü de gerekli.')
         plan = []
         for key in ('gece', 'gunduz'):
             label, a, b, cb = self.plan[key]
@@ -2856,6 +2885,8 @@ class AdvancedSettings(tk.Toplevel):
     def reset(self):
         d = kk.DEFAULT_CONFIG
         for key, (_, put) in self.fields.items():
+            if key.startswith('r2_') or key == 'galeri_adresi':
+                continue  # R2 anahtarları "varsayılan" diye silinmesin
             if key == 'uzantilar':
                 put(', '.join(d['uzantilar']))
             elif key in d:
@@ -2865,6 +2896,19 @@ class AdvancedSettings(tk.Toplevel):
             a.set(p['baslangic'])
             b.set(p['bitis'])
             cb.set(mbit_to_choice(p['mbit']))
+
+    def test_r2(self):
+        values = {k: self.fields[k][0]() for k in ('r2_adres', 'r2_kova', 'r2_anahtar', 'r2_gizli')}
+        self.r2_btn.configure(state='disabled')
+        self.r2_msg.configure(text='Deneniyor…', foreground='')
+
+        def done(res):
+            if not self.winfo_exists():
+                return
+            ok, val = res
+            self.r2_btn.configure(state='normal')
+            self.r2_msg.configure(text=f'✔ Bağlantı tamam: {val}' if ok else f'✖ {val}', foreground=GREEN if ok else RED)
+        self.app.bg(kk.r2_test, done, values)
 
     def save(self):
         try:
